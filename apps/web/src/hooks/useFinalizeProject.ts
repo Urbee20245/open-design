@@ -1,4 +1,4 @@
-// Wraps POST /api/projects/:id/finalize/anthropic for the Finalize
+// Wraps POST /api/projects/:id/finalize/<provider> for the Finalize
 // design package button (#451). The daemon route runs synchronously for
 // 60–120 s, so the hook owns:
 //   - request lifecycle (idle / pending / success / error)
@@ -17,11 +17,21 @@ import type {
   ApiErrorCode,
   FinalizeAnthropicRequest,
   FinalizeAnthropicResponse,
+  FinalizeProviderProtocol,
+  WorkspaceCollabContext,
 } from '@open-design/contracts';
+import { workspaceProjectHeaders } from '../collab/workspace-identity';
 
 // 130 000 ms = daemon timeout (120 s) + 10 s buffer so the daemon's
 // own retry/timeout layer always wins under normal failure modes.
 const FETCH_TIMEOUT_MS = 130_000;
+const FINALIZE_PROTOCOLS = new Set<FinalizeProviderProtocol>([
+  'anthropic',
+  'openai',
+  'azure',
+  'google',
+  'ollama',
+]);
 
 export type FinalizeStatus = 'idle' | 'pending' | 'success' | 'error';
 
@@ -47,7 +57,10 @@ interface DaemonErrorEnvelope {
   };
 }
 
-export function useFinalizeProject(projectId: string): FinalizeProjectState {
+export function useFinalizeProject(
+  projectId: string,
+  workspaceContext: WorkspaceCollabContext | null = null,
+): FinalizeProjectState {
   const [status, setStatus] = useState<FinalizeStatus>('idle');
   const [error, setError] = useState<FinalizeError | null>(null);
   const [result, setResult] = useState<FinalizeAnthropicResponse | null>(null);
@@ -86,13 +99,20 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
       // setStatus('idle') while the second request is still pending,
       // clearing the spinner and re-enabling the buttons mid-flight.
       const isCurrent = () => abortRef.current === controller;
+      const protocol =
+        typeof req.protocol === 'string' && FINALIZE_PROTOCOLS.has(req.protocol)
+          ? req.protocol
+          : 'anthropic';
 
       try {
         const resp = await fetch(
-          `/api/projects/${encodeURIComponent(projectId)}/finalize/anthropic`,
+          `/api/projects/${encodeURIComponent(projectId)}/finalize/${protocol}`,
           {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(workspaceContext ? workspaceProjectHeaders(workspaceContext) : {}),
+            },
             body: JSON.stringify(req),
             signal: controller.signal,
           },
@@ -156,7 +176,7 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
         if (abortRef.current === controller) abortRef.current = null;
       }
     },
-    [projectId],
+    [projectId, workspaceContext],
   );
 
   return { status, error, result, trigger, cancel };
@@ -174,9 +194,9 @@ export function messageForCode(code: ApiErrorCode | 'NETWORK_ERROR' | string): s
     case 'FORBIDDEN':
       return 'Access denied by the upstream API.';
     case 'RATE_LIMITED':
-      return 'Anthropic rate-limited the request. Try again in a minute.';
+      return 'The selected provider rate-limited the request. Try again in a minute.';
     case 'UPSTREAM_UNAVAILABLE':
-      return 'The Anthropic API is unavailable right now.';
+      return 'The selected provider API is unavailable right now.';
     case 'CONFLICT':
       return 'Another finalize is in progress for this project.';
     case 'PROJECT_NOT_FOUND':

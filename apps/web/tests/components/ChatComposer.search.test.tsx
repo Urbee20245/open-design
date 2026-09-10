@@ -1,13 +1,19 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ChatComposer } from '../../src/components/ChatComposer';
+import { I18nProvider } from '../../src/i18n';
 import { ANNOTATION_EVENT } from '../../src/components/PreviewDrawOverlay';
 import { uploadProjectFiles } from '../../src/providers/registry';
+import { readExpandedIndexCss } from '../helpers/read-expanded-css';
+import {
+  composerText,
+  pressEnter,
+  typeAndSettle,
+  typeInComposer,
+} from '../helpers/lexical-composer';
 import type { ChatAttachment, ChatCommentAttachment } from '../../src/types';
 
 vi.mock('../../src/providers/registry', async () => {
@@ -28,7 +34,156 @@ afterEach(() => {
 });
 
 describe('ChatComposer /search command', () => {
-  it('keeps concurrent queued visual annotations distinct after uploads resolve', async () => {
+  it('rejects dropped folders before the upload path can read them', async () => {
+    const directory = new File([], 'reference-assets');
+    mockedUploadProjectFiles.mockResolvedValue({ uploaded: [], failed: [] });
+
+    render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[]}
+        streaming={false}
+        onEnsureProject={async () => 'project-1'}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    fireEvent.drop(screen.getByTestId('chat-composer'), {
+      dataTransfer: {
+        files: [directory],
+        items: [
+          {
+            kind: 'file',
+            getAsFile: () => directory,
+            webkitGetAsEntry: () => ({ isDirectory: true, isFile: false, name: directory.name }),
+          },
+        ],
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/folders can't be attached/i)).toBeTruthy();
+    });
+    expect(mockedUploadProjectFiles).not.toHaveBeenCalled();
+  });
+
+  it('sends staged file attachments even when the text draft is empty', async () => {
+    const onSend = vi.fn();
+    mockedUploadProjectFiles.mockResolvedValue({
+      uploaded: [{ path: 'brief.pdf', name: 'brief.pdf', kind: 'file', size: 5 }],
+      failed: [],
+    });
+
+    render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[]}
+        streaming={false}
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    const file = new File(['brief'], 'brief.pdf', { type: 'application/pdf' });
+    fireEvent.change(screen.getByTestId('chat-file-input'), {
+      target: { files: [file] },
+    });
+
+    // 文档卡的名字拆成【主名 + 后缀】两段(后缀永不参与截断),所以整串不是
+    // 一个文本节点 —— 按托盘的 textContent 找,别用 getByText。
+    await waitFor(() =>
+      expect(screen.getByTestId('staged-attachments').textContent).toContain('brief.pdf'),
+    );
+    fireEvent.click(screen.getByTestId('chat-send'));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(onSend).toHaveBeenCalledWith(
+      '',
+      [{ path: 'brief.pdf', name: 'brief.pdf', kind: 'file', size: 5, order: 0 }],
+      [],
+      undefined,
+    );
+  });
+
+  it('appends uploaded attachments after already staged design-file context', async () => {
+    const onSend = vi.fn();
+    mockedUploadProjectFiles.mockResolvedValue({
+      uploaded: [{ path: 'uploads/pasted.png', name: 'pasted.png', kind: 'image', size: 8 }],
+      failed: [],
+    });
+
+    render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[
+          {
+            path: 'designs/landing.html',
+            name: 'landing.html',
+            kind: 'html',
+            mime: 'text/html',
+            mtime: 1,
+            size: 128,
+          },
+        ]}
+        streaming={false}
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await typeAndSettle('@landing');
+    await waitFor(() => expect(screen.getByText('designs/landing.html')).toBeTruthy());
+    fireEvent.click(screen.getByText('designs/landing.html'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('staged-attachments').textContent).toContain('landing.html'),
+    );
+
+    fireEvent.change(screen.getByTestId('chat-file-input'), {
+      target: { files: [new File(['pasted'], 'pasted.png', { type: 'image/png' })] },
+    });
+
+    // Image chips are thumbnail-only; the name is exposed through the
+    // preview trigger's aria-label rather than chip text.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Preview pasted.png' })).toBeTruthy());
+    fireEvent.click(screen.getByTestId('chat-send'));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(onSend).toHaveBeenCalledWith(
+      '@designs/landing.html',
+      [
+        { path: 'designs/landing.html', name: 'landing.html', kind: 'file', order: 0 },
+        { path: 'uploads/pasted.png', name: 'pasted.png', kind: 'image', size: 8, order: 1 },
+      ],
+      [],
+      undefined,
+    );
+  });
+
+  it('queues a typed follow-up when send is clicked during streaming', async () => {
+    const onSend = vi.fn();
+
+    render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[]}
+        streaming
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await typeAndSettle('follow-up while busy');
+    fireEvent.click(screen.getByTestId('chat-send'));
+
+    expect(onSend).toHaveBeenCalledWith('follow-up while busy', [], [], undefined);
+  });
+
+  it('auto-sends concurrent queued visual annotations when streaming ends', async () => {
     const onSend = vi.fn();
     const firstUpload = deferred<Awaited<ReturnType<typeof uploadProjectFiles>>>();
     const secondUpload = deferred<Awaited<ReturnType<typeof uploadProjectFiles>>>();
@@ -82,11 +237,7 @@ describe('ChatComposer /search command', () => {
       await Promise.all([firstUpload.promise, secondUpload.promise]);
     });
 
-    await waitFor(() => expect(screen.getByText('first.png')).toBeTruthy());
-    expect(screen.getByText('second.png')).toBeTruthy();
-    const input = screen.getByTestId('chat-composer-input') as HTMLTextAreaElement;
-    expect(input.value).toContain('first note');
-    expect(input.value).toContain('second note');
+    expect(onSend).not.toHaveBeenCalled();
     expect(screen.queryByTestId('staged-comment-attachments')).toBeNull();
 
     rerender(
@@ -99,25 +250,23 @@ describe('ChatComposer /search command', () => {
         onStop={vi.fn()}
       />,
     );
-    fireEvent.click(screen.getByTestId('chat-send'));
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-    const [, attachments, commentAttachments] = onSend.mock.calls[0]! as [
+    const [prompt, attachments, commentAttachments] = onSend.mock.calls[0]! as [
       string,
       ChatAttachment[],
       ChatCommentAttachment[],
     ];
-    expect(attachments).toEqual(expect.arrayContaining([
-      { path: 'uploads/first.png', name: 'first.png', kind: 'image' },
-      { path: 'uploads/second.png', name: 'second.png', kind: 'image' },
-    ]));
-    expect(commentAttachments).toHaveLength(2);
-    expect(new Set(commentAttachments.map((attachment) => attachment.id)).size).toBe(2);
-    expect(commentAttachments.map((attachment) => attachment.order)).toEqual([1, 2]);
-    expect(commentAttachments.map((attachment) => attachment.screenshotPath).sort()).toEqual([
-      'uploads/first.png',
-      'uploads/second.png',
+    expect(prompt).toContain('first note');
+    expect(prompt).toContain('second note');
+    expect(attachments).toEqual([
+      { path: 'uploads/first.png', name: 'first.png', kind: 'image', order: 0 },
+      { path: 'uploads/second.png', name: 'second.png', kind: 'image', order: 1 },
     ]);
+    expect(commentAttachments).toHaveLength(2);
+    expect(commentAttachments[0]?.screenshotPath).toBe('uploads/first.png');
+    expect(commentAttachments[1]?.screenshotPath).toBe('uploads/second.png');
+    expect(commentAttachments[0]?.id).not.toBe(commentAttachments[1]?.id);
   });
 
   it('sends draw annotations directly when requested', async () => {
@@ -149,12 +298,12 @@ describe('ChatComposer /search command', () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
     expect(mockedUploadProjectFiles).toHaveBeenCalledWith('project-1', [
       expect.objectContaining({ name: 'drawing.png', type: 'image/png' }),
-    ]);
+    ], undefined, null);
     expect(onSend).toHaveBeenCalledWith(
       'please update this spot',
-      [{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image' }],
+      [{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image', order: 0 }],
       [],
-      undefined,
+      { entryFrom: 'mark' },
     );
   });
 
@@ -199,7 +348,7 @@ describe('ChatComposer /search command', () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
     const [prompt, attachments, commentAttachments] = onSend.mock.calls[0]!;
     expect(prompt).toBe('make this card clearer');
-    expect(attachments).toEqual([{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image' }]);
+    expect(attachments).toEqual([{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image', order: 0 }]);
     expect(commentAttachments).toHaveLength(1);
     expect(commentAttachments[0]).toMatchObject({
       selectionKind: 'visual',
@@ -212,7 +361,7 @@ describe('ChatComposer /search command', () => {
     });
   });
 
-  it('queues draw screenshots with hidden visual target context while streaming', async () => {
+  it('stages draw annotations into the composer input without sending', async () => {
     const onSend = vi.fn();
     mockedUploadProjectFiles.mockResolvedValue({
       uploaded: [{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image' }],
@@ -220,6 +369,56 @@ describe('ChatComposer /search command', () => {
     });
 
     render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[]}
+        streaming={false}
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    window.dispatchEvent(new CustomEvent(ANNOTATION_EVENT, {
+      detail: {
+        file: new File(['drawing'], 'drawing.png', { type: 'image/png' }),
+        note: 'review this before sending',
+        action: 'draft',
+        filePath: 'index.html',
+        markKind: 'stroke',
+        bounds: { x: 12, y: 24, width: 140, height: 80 },
+      },
+    }));
+
+    await waitFor(() => expect(mockedUploadProjectFiles).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(composerText()).toContain('review this before sending'));
+    expect(screen.getByRole('button', { name: 'Preview drawing.png' })).toBeTruthy();
+    expect(screen.queryByText('Visual mark')).toBeNull();
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId('chat-send'));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const [prompt, attachments, commentAttachments] = onSend.mock.calls[0]!;
+    expect(prompt).toBe('review this before sending');
+    expect(attachments).toEqual([{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image', order: 0 }]);
+    expect(commentAttachments).toHaveLength(1);
+    expect(commentAttachments[0]).toMatchObject({
+      selectionKind: 'visual',
+      screenshotPath: 'uploads/drawing.png',
+      markKind: 'stroke',
+      comment: 'review this before sending',
+    });
+  });
+
+  it('auto-sends queued draw screenshots with hidden visual target context when streaming ends', async () => {
+    const onSend = vi.fn();
+    mockedUploadProjectFiles.mockResolvedValue({
+      uploaded: [{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image' }],
+      failed: [],
+    });
+
+    const { rerender } = render(
       <ChatComposer
         projectId="project-1"
         projectFiles={[]}
@@ -241,64 +440,137 @@ describe('ChatComposer /search command', () => {
       },
     }));
 
-    await waitFor(() => expect(screen.getByText('drawing.png')).toBeTruthy());
     expect(screen.queryByText('Visual mark')).toBeNull();
-    expect(screen.getByText('drawing.png')).toBeTruthy();
     expect(screen.queryByTestId('staged-comment-attachments')).toBeNull();
-    expect((screen.getByTestId('chat-composer-input') as HTMLTextAreaElement).value).toBe('tighten this area');
     expect(onSend).not.toHaveBeenCalled();
-  });
 
-  it('previews a staged image attachment from its chip', () => {
-    const longName = 'drawing-2026-05-13T09-25-03-040Z-with-extra-long-name.png';
-    render(
+    rerender(
       <ChatComposer
         projectId="project-1"
-        projectFiles={[
-          {
-            name: longName,
-            path: `uploads/${longName}`,
-            kind: 'image',
-            mime: 'image/png',
-            size: 1234,
-            mtime: Date.now(),
-          },
-        ]}
+        projectFiles={[]}
         streaming={false}
         onEnsureProject={async () => 'project-1'}
-        onSend={vi.fn()}
+        onSend={onSend}
         onStop={vi.fn()}
       />,
     );
 
-    const input = screen.getByTestId('chat-composer-input');
-    fireEvent.change(input, { target: { value: '@drawing' } });
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const [prompt, attachments, commentAttachments] = onSend.mock.calls[0]!;
+    expect(prompt).toBe('tighten this area');
+    expect(attachments).toEqual([{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image', order: 0 }]);
+    expect(commentAttachments).toHaveLength(1);
+    expect(commentAttachments[0]).toMatchObject({
+      selectionKind: 'visual',
+      screenshotPath: 'uploads/drawing.png',
+      markKind: 'stroke',
+      comment: 'tighten this area',
+    });
+  });
+
+  it('tags entry_from=mark on a draw annotation sent while a run is streaming', async () => {
+    const onSend = vi.fn();
+    mockedUploadProjectFiles.mockResolvedValue({
+      uploaded: [{ path: 'uploads/drawing.png', name: 'drawing.png', kind: 'image' }],
+      failed: [],
+    });
+
+    const { rerender } = render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[]}
+        streaming
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    window.dispatchEvent(new CustomEvent(ANNOTATION_EVENT, {
+      detail: {
+        file: new File(['drawing'], 'drawing.png', { type: 'image/png' }),
+        note: 'tighten this area',
+        action: 'send',
+        filePath: 'index.html',
+        markKind: 'stroke',
+        bounds: { x: 12, y: 24, width: 140, height: 80 },
+      },
+    }));
+
+    await waitFor(() => expect(mockedUploadProjectFiles).toHaveBeenCalledTimes(1));
+    expect(onSend).not.toHaveBeenCalled();
+
+    rerender(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[]}
+        streaming={false}
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const meta = onSend.mock.calls[0]![3];
+    expect(meta).toMatchObject({ entryFrom: 'mark' });
+  });
+
+  it('previews a staged image attachment from its chip', async () => {
+    const longName = 'drawing-2026-05-13T09-25-03-040Z-with-extra-long-name.png';
+    render(
+      <I18nProvider initial="fr">
+        <ChatComposer
+          projectId="project-1"
+          projectFiles={[
+            {
+              name: longName,
+              path: `uploads/${longName}`,
+              kind: 'image',
+              mime: 'image/png',
+              size: 1234,
+              mtime: Date.now(),
+            },
+          ]}
+          streaming={false}
+          onEnsureProject={async () => 'project-1'}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    await typeAndSettle('@drawing');
+    await waitFor(() => expect(screen.getByText(`uploads/${longName}`)).toBeTruthy());
     fireEvent.click(screen.getByText(`uploads/${longName}`));
 
-    const chip = screen.getByTestId('staged-attachments').querySelector('.staged-chip.staged-image');
-    const previewTrigger = screen.getByRole('button', { name: `Preview ${longName}` });
+    const chip = screen.getByTestId('staged-attachments').querySelector('[data-testid="staged-attachment-image"]');
+    const previewTrigger = screen.getByRole('button', { name: `Aperçu de ${longName}` });
     expect(chip?.contains(previewTrigger)).toBe(true);
-    expect(chip?.contains(screen.getByRole('button', { name: `Remove ${longName}` }))).toBe(true);
+    expect(chip?.contains(screen.getByRole('button', { name: `Retirer ${longName}` }))).toBe(true);
     expect(previewTrigger.querySelector('img')).toBeTruthy();
-    expect(previewTrigger.querySelector('.staged-name')?.textContent).toBe(longName);
+    // 图卡上不挂文件名 —— 缩略图本身就是它的名字,名字只进 title / aria-label。
+    expect(chip?.textContent).toBe('');
+    expect(previewTrigger.getAttribute('title')).toBe(longName);
 
     fireEvent.click(previewTrigger);
 
     const dialog = screen.getByRole('dialog', { name: longName });
     expect(dialog).toBeTruthy();
     expect(dialog.classList.contains('staged-preview-modal')).toBe(true);
-    expect(dialog.querySelector('.staged-preview-card')).toBeTruthy();
-    expect(dialog.querySelector('.staged-preview-head')).toBeTruthy();
+    const card = within(dialog).getByTestId('staged-preview-card');
+    expect(within(dialog).getByTestId('staged-preview-head')).toBeTruthy();
     const previewImage = screen.getByRole('img', { name: longName }) as HTMLImageElement;
     expect(previewImage.src).toContain(`/api/projects/project-1/raw/uploads/${longName}`);
-    expect(dialog.querySelector('.staged-preview-card > img')).toBe(previewImage);
+    // 图必须是卡的**直接子节点**(套一层就会破坏那套等比撑满的布局)
+    expect(card.querySelector(':scope > img')).toBe(previewImage);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Fermer' }));
     expect(screen.queryByRole('dialog', { name: longName })).toBeNull();
   });
 
   it('keeps staged image preview modal styling available', () => {
-    const css = readFileSync(join(process.cwd(), 'src/index.css'), 'utf8');
+    const css = readExpandedIndexCss();
 
     expect(css).toContain('.staged-preview-modal');
     expect(css).toContain('position: fixed;');
@@ -313,7 +585,7 @@ describe('ChatComposer /search command', () => {
     expect(css).toContain('object-fit: contain;');
   });
 
-  it('expands /search into a first-action research command prompt', () => {
+  it('expands /search into a first-action research command prompt', async () => {
     const onSend = vi.fn();
 
     render(
@@ -328,11 +600,10 @@ describe('ChatComposer /search command', () => {
       />,
     );
 
-    const input = screen.getByTestId('chat-composer-input');
-    fireEvent.change(input, { target: { value: '/search EV market 2025 trends' } });
+    await typeAndSettle('/search EV market 2025 trends');
     fireEvent.click(screen.getByTestId('chat-send'));
 
-    expect(onSend).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
     const [prompt, attachments, commentAttachments, meta] = onSend.mock.calls[0]!;
     expect(prompt).toContain(
       'Before answering, your first tool action must be the OD research command for your shell.',
@@ -349,10 +620,10 @@ describe('ChatComposer /search command', () => {
     expect(prompt).toContain('Canonical query:');
     expect(prompt).toContain('EV market 2025 trends');
     expect(prompt).toContain(
-      'If the OD command fails because Tavily is not configured or unavailable',
+      'If the OD command fails, keep the stderr / exit status in the tool trace and daemon logs',
     );
     expect(prompt).toContain(
-      'use your own search capability as fallback and label the fallback clearly',
+      'use your own search capability as fallback. Label the fallback clearly',
     );
     expect(prompt).toContain('write a reusable Markdown report into Design Files');
     expect(prompt).toContain('research/<safe-query-slug>.md');
@@ -365,7 +636,7 @@ describe('ChatComposer /search command', () => {
     });
   });
 
-  it('keeps shell metacharacters out of the concrete OD command examples', () => {
+  it('keeps shell metacharacters out of the concrete OD command examples', async () => {
     const onSend = vi.fn();
 
     render(
@@ -381,12 +652,11 @@ describe('ChatComposer /search command', () => {
     );
 
     const query = "$TSLA `date` $(echo hacked) Bob's";
-    fireEvent.change(screen.getByTestId('chat-composer-input'), {
-      target: { value: `/search ${query}` },
-    });
+    await typeAndSettle(`/search ${query}`);
     fireEvent.click(screen.getByTestId('chat-send'));
 
-    const [prompt, _attachments, _commentAttachments, meta] = onSend.mock.calls[0]!;
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const [prompt, , , meta] = onSend.mock.calls[0]!;
     expect(prompt).toContain(
       'POSIX: "$OD_NODE_BIN" "$OD_BIN" research search --query "<search query>" --max-sources 5',
     );
@@ -397,7 +667,7 @@ describe('ChatComposer /search command', () => {
     });
   });
 
-  it('does not send research metadata for normal prompts', () => {
+  it('does not send research metadata for normal prompts', async () => {
     const onSend = vi.fn();
 
     render(
@@ -412,12 +682,10 @@ describe('ChatComposer /search command', () => {
       />,
     );
 
-    fireEvent.change(screen.getByTestId('chat-composer-input'), {
-      target: { value: 'EV market 2025 trends' },
-    });
+    await typeAndSettle('EV market 2025 trends');
     fireEvent.click(screen.getByTestId('chat-send'));
 
-    expect(onSend).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
     const [prompt, attachments, commentAttachments, meta] = onSend.mock.calls[0]!;
     expect(prompt).toBe('EV market 2025 trends');
     expect(attachments).toEqual([]);
@@ -425,7 +693,7 @@ describe('ChatComposer /search command', () => {
     expect(meta).toBeUndefined();
   });
 
-  it('does not expand manually typed /search when research is unavailable', () => {
+  it('does not expand manually typed /search when research is unavailable', async () => {
     const onSend = vi.fn();
 
     render(
@@ -440,12 +708,10 @@ describe('ChatComposer /search command', () => {
       />,
     );
 
-    fireEvent.change(screen.getByTestId('chat-composer-input'), {
-      target: { value: '/search EV market 2025 trends' },
-    });
+    await typeAndSettle('/search EV market 2025 trends');
     fireEvent.click(screen.getByTestId('chat-send'));
 
-    expect(onSend).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
     const [prompt, attachments, commentAttachments, meta] = onSend.mock.calls[0]!;
     expect(prompt).toBe('/search EV market 2025 trends');
     expect(attachments).toEqual([]);
@@ -453,7 +719,28 @@ describe('ChatComposer /search command', () => {
     expect(meta).toBeUndefined();
   });
 
-  it('keeps keyboard submits blocked when sending is disabled', () => {
+  it('submits the draft on plain Enter (same as Home hero)', async () => {
+    const onSend = vi.fn();
+
+    render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[]}
+        streaming={false}
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await typeAndSettle('hello world');
+    pressEnter();
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(onSend).toHaveBeenCalledWith('hello world', [], [], undefined);
+  });
+
+  it('keeps keyboard submits blocked when sending is disabled', async () => {
     const onSend = vi.fn();
 
     render(
@@ -469,12 +756,56 @@ describe('ChatComposer /search command', () => {
       />,
     );
 
-    const input = screen.getByTestId('chat-composer-input');
-    fireEvent.change(input, { target: { value: 'keep this draft' } });
-    fireEvent.keyDown(input, { key: 'Enter', metaKey: true });
+    typeInComposer('keep this draft');
+    pressEnter({ meta: true });
+    pressEnter();
 
     expect(onSend).not.toHaveBeenCalled();
-    expect((input as HTMLTextAreaElement).value).toBe('keep this draft');
+    expect(composerText()).toContain('keep this draft');
+  });
+
+  it('shows the active imported-folder file and sends it as edit context', async () => {
+    const onSend = vi.fn();
+
+    render(
+      <ChatComposer
+        projectId="project-1"
+        projectFiles={[
+          {
+            name: 'site/index.html',
+            path: 'site/index.html',
+            type: 'file',
+            kind: 'html',
+            mime: 'text/html',
+            size: 128,
+            mtime: 1,
+          },
+        ]}
+        activeProjectFileName="site/index.html"
+        streaming={false}
+        projectMetadata={{ kind: 'prototype', importedFrom: 'folder' }}
+        onEnsureProject={async () => 'project-1'}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+
+    const activeFileStrip = screen.getByTestId('composer-active-file');
+    expect(activeFileStrip.textContent).toContain('Editing');
+    expect(activeFileStrip.textContent).toContain('site/index.html');
+    expect(screen.getByTestId('chat-composer').className).toContain('composer-active-file-mode');
+
+    expect(screen.getAllByText('Ask OpenDesign to change index.html...').length).toBeGreaterThan(0);
+    await typeAndSettle('Make the hero clearer');
+    fireEvent.click(screen.getByTestId('chat-send'));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(onSend).toHaveBeenCalledWith(
+      'Make the hero clearer',
+      [{ path: 'site/index.html', name: 'index.html', kind: 'file' }],
+      [],
+      undefined,
+    );
   });
 });
 

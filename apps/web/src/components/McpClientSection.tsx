@@ -1,6 +1,6 @@
 // External MCP servers panel.
 //
-// Open Design connects to the configured servers as a CLIENT and surfaces
+// OpenDesign connects to the configured servers as a CLIENT and surfaces
 // their tools to the underlying agent (Claude Code, Hermes, Kimi for v1).
 // This panel is the user-facing form; persistence flows through
 // `state/mcp.ts` -> daemon `/api/mcp/servers`.
@@ -13,6 +13,13 @@ import {
   useRef,
   useState,
 } from 'react';
+import { Button } from '@open-design/components';
+import { useAnalytics } from '../analytics/provider';
+import {
+  trackIntegrationsMcpTabClick,
+  trackSettingsExternalMcpClick,
+} from '../analytics/events';
+import type { TrackingExternalMcpElement } from '@open-design/contracts/analytics';
 import {
   disconnectMcpOAuth,
   fetchMcpOAuthStatus,
@@ -26,7 +33,13 @@ import type {
   McpServerConfig,
   McpTemplate,
 } from '../state/mcp';
+import { fetchAgents } from '../providers/registry';
+import type { AgentInfo } from '../types';
+import { isVisibleLocalCliAgent } from '../utils/visibleAgents';
 import { Icon } from './Icon';
+import { useT } from '../i18n';
+
+type Translate = ReturnType<typeof useT>;
 
 interface Props {
   // Receive a notification when servers list changes so the parent can
@@ -35,6 +48,10 @@ interface Props {
   // Surface the dirty/save state up to the dialog footer so a single
   // "Save" button can drive both the global config and this section.
   onDirtyChange?: (dirty: boolean) => void;
+  // This section renders on two surfaces: the Integrations MCP tab and the
+  // Settings -> External MCP panel. Defaults to 'integrations' so the
+  // IntegrationsView call site stays unchanged.
+  surface?: 'integrations' | 'settings';
 }
 
 // Imperative handle: lets the dialog footer Save button trigger this
@@ -63,9 +80,50 @@ function genLocalId(): string {
   return `mcp-row-${NEXT_LOCAL_ID++}`;
 }
 
+function isLoopbackMcpUrl(rawUrl: string | undefined): boolean {
+  if (!rawUrl) return false;
+  try {
+    const host = new URL(rawUrl)
+      .hostname
+      .replace(/^\[|\]$/g, '')
+      .toLowerCase()
+      .replace(/\.+$/g, '');
+    if (host === 'localhost' || host === '::1') return true;
+    if (/^127(?:\.\d{1,3}){3}$/.test(host)) return true;
+    return /^::ffff:127(?:\.\d{1,3}){3}$/i.test(host);
+  } catch {
+    return false;
+  }
+}
+
+function inferMcpAuthMode(url: string | undefined): NonNullable<McpServerConfig['authMode']> {
+  return isLoopbackMcpUrl(url) ? 'none' : 'oauth';
+}
+
+function effectiveMcpAuthMode(
+  row: Pick<McpServerConfig, 'transport' | 'url' | 'authMode'>,
+): NonNullable<McpServerConfig['authMode']> {
+  if (row.transport !== 'http' && row.transport !== 'sse') return 'none';
+  return row.authMode ?? inferMcpAuthMode(row.url);
+}
+
+function authModeAfterUrlChange(
+  row: Pick<McpServerConfig, 'url' | 'authMode'>,
+  nextUrl: string,
+): NonNullable<McpServerConfig['authMode']> {
+  const previousInferred = inferMcpAuthMode(row.url);
+  if (!row.authMode || row.authMode === previousInferred) {
+    return inferMcpAuthMode(nextUrl);
+  }
+  return row.authMode;
+}
+
 function rowsFromServers(servers: McpServerConfig[]): DraftRow[] {
   return servers.map((s) => ({
     ...s,
+    ...(s.transport === 'http' || s.transport === 'sse'
+      ? { authMode: effectiveMcpAuthMode(s) }
+      : {}),
     _envText: s.env ? mapToText(s.env) : '',
     _headersText: s.headers ? mapToText(s.headers) : '',
     _localId: genLocalId(),
@@ -109,6 +167,7 @@ function rowsToServers(rows: DraftRow[]): McpServerConfig[] {
       const env = textToMap(r._envText);
       if (env) out.env = env;
     } else {
+      out.authMode = effectiveMcpAuthMode(r);
       if (r.url) out.url = r.url;
       const headers = textToMap(r._headersText);
       if (headers) out.headers = headers;
@@ -132,6 +191,9 @@ function rowFromTemplate(
     templateId: tpl.id,
     transport: tpl.transport,
     enabled: true,
+    ...(tpl.transport === 'http' || tpl.transport === 'sse'
+      ? { authMode: tpl.authMode ?? inferMcpAuthMode(tpl.url) }
+      : {}),
     command: tpl.command,
     args: tpl.args ? [...tpl.args] : undefined,
     url: tpl.url,
@@ -161,54 +223,56 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 // Picker grouping. Mirrors `McpTemplateCategory` in `packages/contracts`.
 // The order here is the *display* order in the picker — keep it intentional
-// so the most useful categories for Open Design (visual generation, then
+// so the most useful categories for OpenDesign (visual generation, then
 // editing, then publishing surfaces) sit at the top.
-const CATEGORY_ORDER: ReadonlyArray<{
+function categoryOrder(t: Translate): ReadonlyArray<{
   id: NonNullable<McpTemplate['category']>;
   label: string;
   hint: string;
-}> = [
-  {
-    id: 'image-generation',
-    label: 'Image generation',
-    hint: 'Models that produce raster, vector or video assets.',
-  },
-  {
-    id: 'image-editing',
-    label: 'Image editing',
-    hint: 'Local post-processing, OCR and CV-driven edits.',
-  },
-  {
-    id: 'web-capture',
-    label: 'Web capture',
-    hint: 'Render a URL into an image so the agent can see what it built.',
-  },
-  {
-    id: 'design-systems',
-    label: 'Design systems',
-    hint: 'Figma read/write, design-token translation, brand inspiration.',
-  },
-  {
-    id: 'ui-components',
-    label: 'UI components',
-    hint: 'Designer-grade components, blocks and landing-page material.',
-  },
-  {
-    id: 'data-viz',
-    label: 'Data viz',
-    hint: 'Charts and diagrams as proper image artifacts.',
-  },
-  {
-    id: 'publishing',
-    label: 'Publishing',
-    hint: 'Push generated artifacts to a public URL.',
-  },
-  {
-    id: 'utilities',
-    label: 'Utilities',
-    hint: 'Filesystem, fetch, GitHub and similar generic tools.',
-  },
-];
+}> {
+  return [
+    {
+      id: 'image-generation',
+      label: t('mcp.categoryImageGeneration'),
+      hint: t('mcp.categoryImageGenerationHint'),
+    },
+    {
+      id: 'image-editing',
+      label: t('mcp.categoryImageEditing'),
+      hint: t('mcp.categoryImageEditingHint'),
+    },
+    {
+      id: 'web-capture',
+      label: t('mcp.categoryWebCapture'),
+      hint: t('mcp.categoryWebCaptureHint'),
+    },
+    {
+      id: 'design-systems',
+      label: t('mcp.categoryDesignSystems'),
+      hint: t('mcp.categoryDesignSystemsHint'),
+    },
+    {
+      id: 'ui-components',
+      label: t('mcp.categoryUiComponents'),
+      hint: t('mcp.categoryUiComponentsHint'),
+    },
+    {
+      id: 'data-viz',
+      label: t('mcp.categoryDataViz'),
+      hint: t('mcp.categoryDataVizHint'),
+    },
+    {
+      id: 'publishing',
+      label: t('mcp.categoryPublishing'),
+      hint: t('mcp.categoryPublishingHint'),
+    },
+    {
+      id: 'utilities',
+      label: t('mcp.categoryUtilities'),
+      hint: t('mcp.categoryUtilitiesHint'),
+    },
+  ];
+}
 
 function templateMatchesQuery(tpl: McpTemplate, q: string): boolean {
   if (!q) return true;
@@ -221,21 +285,21 @@ function templateMatchesQuery(tpl: McpTemplate, q: string): boolean {
   );
 }
 
-function validateRow(r: DraftRow): string | null {
+function validateRow(r: DraftRow, t: Translate): string | null {
   if (!ID_PATTERN.test(r.id)) {
-    return 'ID must start with a letter or digit and only contain letters, digits, dash, or underscore (max 64 chars).';
+    return t('mcp.idInvalid');
   }
   if (r.transport === 'stdio') {
-    if (!r.command || !r.command.trim()) return 'Command is required for stdio transport.';
+    if (!r.command || !r.command.trim()) return t('mcp.commandRequired');
   } else {
-    if (!r.url || !r.url.trim()) return 'URL is required for SSE / HTTP transport.';
+    if (!r.url || !r.url.trim()) return t('mcp.urlRequired');
     try {
       const parsed = new URL(r.url);
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        return 'URL must use http:// or https://.';
+        return t('mcp.urlProtocolInvalid');
       }
     } catch {
-      return 'URL is malformed.';
+      return t('mcp.urlMalformed');
     }
   }
   return null;
@@ -248,7 +312,31 @@ function signature(rows: DraftRow[]): string {
 }
 
 export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
-  function McpClientSection({ onServersChanged, onDirtyChange }, ref) {
+  function McpClientSection({ onServersChanged, onDirtyChange, surface = 'integrations' }, ref) {
+  const t = useT();
+  const analytics = useAnalytics();
+  // Single dispatch point for every click in this section: routes to the
+  // payload matching the surface the section is rendered on.
+  const trackMcpClick = (
+    element: TrackingExternalMcpElement,
+    extra?: { template_id?: string },
+  ) => {
+    if (surface === 'settings') {
+      trackSettingsExternalMcpClick(analytics.track, {
+        page_name: 'settings',
+        area: 'external_mcp',
+        element,
+        ...extra,
+      });
+    } else {
+      trackIntegrationsMcpTabClick(analytics.track, {
+        page_name: 'integrations',
+        area: 'mcp_tab',
+        element,
+        ...extra,
+      });
+    }
+  };
   const [rows, setRows] = useState<DraftRow[]>([]);
   const [savedSig, setSavedSig] = useState<string>('[]');
   const [templates, setTemplates] = useState<McpTemplate[]>([]);
@@ -261,6 +349,11 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
   // picker preserves the user's last query while they scan through it.
   const [pickerQuery, setPickerQuery] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // Cached agent list so the support banner can tell the user which of the
+  // installed CLI agents will actually receive the MCP servers below.
+  // Without this, OpenCode / Codex / Gemini users save a server and have
+  // no way to learn it never reached the agent (issue #2142).
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -268,7 +361,7 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
       const data = await fetchMcpServers();
       if (cancelled) return;
       if (!data) {
-        setError('Could not reach the local daemon. Make sure Open Design is running, then reopen this panel.');
+        setError(t('mcpClient.daemonError'));
         setLoaded(true);
         return;
       }
@@ -277,6 +370,18 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
       setSavedSig(signature(fresh));
       setTemplates(data.templates);
       setLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const list = await fetchAgents();
+      if (cancelled) return;
+      setAgents(list);
     })();
     return () => {
       cancelled = true;
@@ -308,18 +413,20 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
   };
 
   const addFromTemplate = (tpl: McpTemplate) => {
+    trackMcpClick('pick_template', { template_id: tpl.id.replace(/-/g, '_') });
     setPickerOpen(false);
     setRows((curr) => [...curr, rowFromTemplate(tpl, new Set(curr.map((r) => r.id)))]);
   };
 
   const addBlank = () => {
+    trackMcpClick('pick_blank');
     setPickerOpen(false);
     setRows((curr) => [...curr, rowFromBlank(new Set(curr.map((r) => r.id)))]);
   };
 
   const save = async (): Promise<boolean> => {
     for (const r of rows) {
-      const err = validateRow(r);
+      const err = validateRow(r, t);
       if (err) {
         setError(`${r.label || r.id}: ${err}`);
         return false;
@@ -331,7 +438,7 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
     const data = await saveMcpServers(payload);
     setSaving(false);
     if (!data) {
-      setError('Save failed. Check that the daemon is running and try again.');
+      setError(t('mcpClient.saveFailed'));
       return false;
     }
     const fresh = rowsFromServers(data.servers);
@@ -353,8 +460,8 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
       <section className="settings-section">
         <div className="section-head">
           <div>
-            <h3>External MCP servers</h3>
-            <p className="hint">Loading…</p>
+            <h3>{t('mcpClient.title')}</h3>
+            <p className="hint">{t('common.loading')}</p>
           </div>
         </div>
       </section>
@@ -365,22 +472,24 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
     <section className="settings-section">
       <div className="section-head">
         <div>
-          <h3>External MCP servers</h3>
-          <p className="hint">
-            Surface tools from third-party MCP servers (Higgsfield, GitHub,
-            filesystem…) to your coding agent.
-          </p>
+          <h3>{t('mcpClient.title')}</h3>
+          <p className="hint">{t('mcpClient.subtitle')}</p>
         </div>
         <button
           type="button"
           className="primary mcp-add-btn"
-          onClick={() => setPickerOpen((v) => !v)}
+          onClick={() => {
+            trackMcpClick('add_server');
+            setPickerOpen((v) => !v);
+          }}
           aria-expanded={pickerOpen}
         >
-          <Icon name="sparkles" size={13} />
-          <span>Add server</span>
+          <Icon name="sparkles" size={14} />
+          <span>{t('mcpClient.addServer')}</span>
         </button>
       </div>
+
+      <McpAgentSupportBanner agents={agents} />
 
       {pickerOpen ? (
         <PickerPanel
@@ -399,11 +508,9 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
 
       {rows.length === 0 ? (
         <div className="empty-card">
-          <strong>No MCP servers configured.</strong>
+          <strong>{t('mcpClient.emptyTitle')}</strong>
           <p className="hint">
-            Click &ldquo;Add server&rdquo; to get started — pick a template
-            (Higgsfield OpenClaw, Pollinations, Allyson, Imagician, EdgeOne
-            Pages, GitHub, Filesystem…) or set up a custom stdio / HTTP server.
+            {t('mcpClient.emptyBody')}
           </p>
         </div>
       ) : (
@@ -416,11 +523,19 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
               total={rows.length}
               template={
                 row.templateId
-                  ? templates.find((t) => t.id === row.templateId)
+                  ? templates.find((tpl) => tpl.id === row.templateId)
                   : undefined
               }
               onChange={(patch) => updateRow(idx, patch)}
-              onRemove={() => removeRow(idx)}
+              onRemove={() => {
+                trackMcpClick(
+                  'remove_server',
+                  row.templateId
+                    ? { template_id: row.templateId.replace(/-/g, '_') }
+                    : undefined,
+                );
+                removeRow(idx);
+              }}
               onMoveUp={idx > 0 ? () => moveRow(idx, -1) : undefined}
               onMoveDown={idx < rows.length - 1 ? () => moveRow(idx, 1) : undefined}
             />
@@ -432,17 +547,20 @@ export const McpClientSection = forwardRef<McpClientSectionHandle, Props>(
         <button
           type="button"
           className="primary"
-          onClick={() => void save()}
+          onClick={() => {
+            trackMcpClick('saved');
+            void save();
+          }}
           disabled={saving || !dirty}
         >
-          {saving ? 'Saving…' : dirty ? 'Save changes' : 'Saved'}
+          {saving ? t('settings.autosaveSaving') : dirty ? t('mcpClient.saveChanges') : t('settings.autosaveSaved')}
         </button>
         {savedAt && !dirty ? (
-          <span className="hint mcp-saved-msg">Saved.</span>
+          <span className="hint mcp-saved-msg">{t('settings.connectorsSaved')}.</span>
         ) : null}
         <span className="mcp-foot-spacer" />
         <span className="hint">
-          Stored at <code>.od/mcp-config.json</code>
+          {t('mcpClient.storedAt')} <code>.od/mcp-config.json</code>
         </span>
       </div>
     </section>
@@ -479,6 +597,7 @@ function PickerPanel({
   onPickBlank,
   onClose,
 }: PickerPanelProps) {
+  const t = useT();
   const grouped = useMemo(() => {
     const buckets = new Map<McpTemplate['category'], McpTemplate[]>();
     for (const tpl of templates) {
@@ -495,9 +614,9 @@ function PickerPanel({
   // Total visible across all groups so we can show an empty-state if the
   // search filters everything out.
   let visibleTotal = 0;
-  const renderGroups = CATEGORY_ORDER.map((cat) => {
+  const renderGroups = categoryOrder(t).map((cat) => {
     const all = grouped.get(cat.id) ?? [];
-    const matched = all.filter((t) => templateMatchesQuery(t, trimmed));
+    const matched = all.filter((item) => templateMatchesQuery(item, trimmed));
     visibleTotal += matched.length;
     if (all.length === 0) return null;
     if (hasQuery && matched.length === 0) return null;
@@ -536,24 +655,24 @@ function PickerPanel({
     <div className="mcp-picker">
       <div className="mcp-picker-head">
         <div className="mcp-picker-head-row">
-          <strong>Pick a template</strong>
+          <strong>{t('mcp.pickTemplate')}</strong>
           <button
             type="button"
             className="icon-btn mcp-picker-close"
             onClick={onClose}
-            title="Close picker"
-            aria-label="Close picker"
+            title={t('mcp.closePicker')}
+            aria-label={t('mcp.closePicker')}
           >
             ×
           </button>
         </div>
         <span className="hint">
-          Pre-fills the form. You can still edit any field after.
+          {t('mcp.pickerHint')}
         </span>
         <input
           type="search"
           className="mcp-picker-search"
-          placeholder="Filter by name, transport, capability…"
+          placeholder={t('mcp.pickerFilterPlaceholder')}
           value={query}
           onChange={(e) => onQueryChange(e.target.value)}
           spellCheck={false}
@@ -565,8 +684,7 @@ function PickerPanel({
         {renderGroups}
         {hasQuery && visibleTotal === 0 ? (
           <div className="mcp-picker-empty hint">
-            No templates match &ldquo;{trimmed}&rdquo;. Try clearing the filter
-            or use the custom server option below.
+            {t('mcp.pickerNoMatch', { query: trimmed })}
           </div>
         ) : null}
       </div>
@@ -578,11 +696,11 @@ function PickerPanel({
           onClick={onPickBlank}
         >
           <span className="mcp-picker-item-head">
-            <Icon name="settings" size={13} />
-            <strong>Custom server</strong>
+            <Icon name="settings" size={14} />
+            <strong>{t('mcp.customServer')}</strong>
           </span>
           <span className="mcp-picker-desc">
-            Empty form. Pick stdio or SSE / HTTP and fill the fields yourself.
+            {t('mcp.customServerDesc')}
           </span>
         </button>
       </div>
@@ -597,6 +715,7 @@ function PickerCard({
   tpl: McpTemplate;
   onPick: () => void;
 }) {
+  const t = useT();
   return (
     <div className="mcp-picker-item">
       <button
@@ -606,14 +725,14 @@ function PickerCard({
         title={tpl.description}
       >
         <span className="mcp-picker-item-head">
-          <Icon name="link" size={13} />
+          <Icon name="link" size={14} />
           <strong>{tpl.label}</strong>
           <span className="mcp-picker-transport">{tpl.transport}</span>
         </span>
         <span className="mcp-picker-desc">{tpl.description}</span>
         {tpl.example ? (
           <span className="mcp-picker-example">
-            <span className="mcp-picker-example-label">Try:</span>
+            <span className="mcp-picker-example-label">{t('mcp.tryLabel')}</span>
             <span className="mcp-picker-example-text">"{tpl.example}"</span>
           </span>
         ) : null}
@@ -626,8 +745,8 @@ function PickerCard({
           rel="noreferrer noopener"
           title={tpl.homepage}
         >
-          <Icon name="external-link" size={11} />
-          <span>Homepage</span>
+          <Icon name="external-link" size={14} />
+          <span>{t('mcp.homepage')}</span>
         </a>
       ) : null}
     </div>
@@ -649,9 +768,11 @@ interface RowProps {
 }
 
 function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMoveDown }: RowProps) {
+  const t = useT();
   const isHttpLike = row.transport === 'http' || row.transport === 'sse';
+  const usesManagedOAuth = isHttpLike && effectiveMcpAuthMode(row) === 'oauth';
   const [expanded, setExpanded] = useState<boolean>(false);
-  const summaryTitle = row.label?.trim() || row.id || 'Unnamed MCP server';
+  const summaryTitle = row.label?.trim() || row.id || t('mcp.unnamedServer');
   const [showMcpExample, setShowMcpExample] = useState<boolean>(false);
   const helperId = `mcp-json-helper-panel-${row._localId}`;
 
@@ -662,12 +783,12 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
       }`}
     >
       <div className="mcp-row-head">
-        <label className="mcp-row-toggle" title={row.enabled ? 'Enabled' : 'Disabled'}>
+        <label className="mcp-row-toggle" title={row.enabled ? t('mcp.enabled') : t('mcp.disabled')}>
           <input
             type="checkbox"
             checked={row.enabled}
             onChange={(e) => onChange({ enabled: e.target.checked })}
-            aria-label="Enable this MCP server"
+            aria-label={t('mcp.enableServerAria')}
           />
         </label>
         {expanded ? (
@@ -675,7 +796,7 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
             type="text"
             className="mcp-row-label"
             value={row.label ?? ''}
-            placeholder="Display name (optional)"
+            placeholder={t('mcp.displayNamePlaceholder')}
             onChange={(e) => onChange({ label: e.target.value })}
           />
         ) : (
@@ -683,12 +804,12 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
             type="button"
             className="mcp-row-summary-title"
             onClick={() => setExpanded(true)}
-            title="Expand to edit"
+            title={t('mcp.expandToEdit')}
           >
             <span className="mcp-row-summary-name">{summaryTitle}</span>
             <span
               className="mcp-row-summary-transport"
-              aria-label={`Transport: ${row.transport}`}
+              aria-label={t('mcp.transportAria', { transport: row.transport })}
             >
               {row.transport}
             </span>
@@ -699,33 +820,32 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
         </span>
         <div className="mcp-row-actions">
           {onMoveUp ? (
-            <button type="button" className="icon-btn" onClick={onMoveUp} title="Move up">
+            <Button size="icon" onClick={onMoveUp} title={t('mcp.moveUp')}>
               ↑
-            </button>
+            </Button>
           ) : null}
           {onMoveDown ? (
-            <button type="button" className="icon-btn" onClick={onMoveDown} title="Move down">
+            <Button size="icon" onClick={onMoveDown} title={t('mcp.moveDown')}>
               ↓
-            </button>
+            </Button>
           ) : null}
-          <button
-            type="button"
-            className="icon-btn"
+          <Button
+            size="icon"
             onClick={onRemove}
-            title="Remove this MCP server"
+            title={t('mcp.removeServer')}
           >
             ×
-          </button>
-          <button
-            type="button"
-            className="icon-btn mcp-row-toggle-btn"
+          </Button>
+          <Button
+            size="icon"
+            className="mcp-row-toggle-btn"
             onClick={() => setExpanded((v) => !v)}
             aria-expanded={expanded}
-            aria-label={expanded ? 'Collapse this MCP server' : 'Expand this MCP server'}
-            title={expanded ? 'Collapse' : 'Expand'}
+            aria-label={expanded ? t('mcp.collapseServerAria') : t('mcp.expandServerAria')}
+            title={expanded ? t('mcp.collapse') : t('mcp.expand')}
           >
-            <Icon name="chevron-down" size={13} />
-          </button>
+            <Icon name="chevron-down" size={14} />
+          </Button>
         </div>
       </div>
 
@@ -735,7 +855,7 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
             <details className="mcp-row-info">
               <summary className="mcp-row-info-summary">
                 <span className="mcp-row-info-summary-label">
-                  About {template.label}
+                  {t('mcp.aboutTemplate', { name: template.label })}
                 </span>
                 {template.homepage ? (
                   <a
@@ -746,8 +866,8 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
                     title={template.homepage}
                     onClick={(e) => e.stopPropagation()}
                   >
-                    <Icon name="external-link" size={11} />
-                    <span>Homepage</span>
+                    <Icon name="external-link" size={14} />
+                    <span>{t('mcp.homepage')}</span>
                   </a>
                 ) : null}
               </summary>
@@ -758,9 +878,9 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
                 {template.example ? (
                   <p
                     className="mcp-row-info-example"
-                    title="Paste this prompt into the chat composer to try the server end-to-end"
+                    title={t('mcp.tryPromptTitle')}
                   >
-                    <span className="mcp-row-info-example-label">Try:</span>{' '}
+                    <span className="mcp-row-info-example-label">{t('mcp.tryLabel')}</span>{' '}
                     <span className="mcp-row-info-example-text">"{template.example}"</span>
                   </p>
                 ) : null}
@@ -769,18 +889,32 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
           ) : null}
 
           {isHttpLike && !row._isNew && row.id ? (
-            <McpOAuthControl serverId={row.id} />
+            usesManagedOAuth ? (
+              <McpOAuthControl serverId={row.id} />
+            ) : (
+              <div className="mcp-oauth-hint hint">
+                <strong>{t('mcp.noManagedOAuth')}</strong>{' '}
+                {t('mcp.noManagedOAuthUseAsConfigured')}
+              </div>
+            )
           ) : null}
-          {isHttpLike && row._isNew ? (
+          {isHttpLike && row._isNew && usesManagedOAuth ? (
             <div className="mcp-oauth-hint hint">
-              Save first, then click <strong>Connect</strong> to grant Open Design
-              access via the provider's OAuth flow.
+              {t('mcp.saveFirstThenClick')}{' '}
+              <strong>{t('mcp.connect')}</strong>{' '}
+              {t('mcp.toGrantOAuthAccess')}
+            </div>
+          ) : null}
+          {isHttpLike && row._isNew && !usesManagedOAuth ? (
+            <div className="mcp-oauth-hint hint">
+              <strong>{t('mcp.noManagedOAuth')}</strong>{' '}
+              {t('mcp.noManagedOAuthSaveDirect')}
             </div>
           ) : null}
 
           <div className="mcp-row-grid">
             <label className="mcp-row-field">
-              <span className="mcp-row-field-label">ID</span>
+              <span className="mcp-row-field-label">{t('mcp.fieldId')}</span>
               <input
                 type="text"
                 value={row.id}
@@ -789,12 +923,18 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
               />
             </label>
             <label className="mcp-row-field">
-              <span className="mcp-row-field-label">Transport</span>
+              <span className="mcp-row-field-label">{t('mcp.fieldTransport')}</span>
               <select
                 value={row.transport}
-                onChange={(e) =>
-                  onChange({ transport: e.target.value as DraftRow['transport'] })
-                }
+                onChange={(e) => {
+                  const transport = e.target.value as DraftRow['transport'];
+                  onChange({
+                    transport,
+                    ...(transport === 'http' || transport === 'sse'
+                      ? { authMode: row.authMode ?? inferMcpAuthMode(row.url) }
+                      : { authMode: undefined }),
+                  });
+                }}
               >
                 <option value="stdio">stdio</option>
                 <option value="sse">SSE</option>
@@ -806,21 +946,21 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
           {row.transport === 'stdio' ? (
             <>
               <label className="mcp-row-field mcp-row-field-stack">
-                <span className="mcp-row-field-label">Command</span>
+                <span className="mcp-row-field-label">{t('mcp.fieldCommand')}</span>
                 <input
                   type="text"
                   value={row.command ?? ''}
-                  placeholder="e.g. npx, node, /path/to/binary"
+                  placeholder={t('mcp.commandPlaceholder')}
                   onChange={(e) => onChange({ command: e.target.value })}
                   spellCheck={false}
                 />
               </label>
               <label className="mcp-row-field mcp-row-field-stack">
-                <span className="mcp-row-field-label">Args</span>
+                <span className="mcp-row-field-label">{t('mcp.fieldArgs')}</span>
                 <input
                   type="text"
                   value={(row.args ?? []).join(' ')}
-                  placeholder="space-separated"
+                  placeholder={t('mcp.argsPlaceholder')}
                   onChange={(e) =>
                     onChange({
                       args: e.target.value
@@ -833,7 +973,7 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
                 />
               </label>
               <label className="mcp-row-field mcp-row-field-stack">
-                <span className="mcp-row-field-label">Env (KEY=VALUE)</span>
+                <span className="mcp-row-field-label">{t('mcp.fieldEnv')}</span>
                 <textarea
                   rows={Math.max(2, (row._envText ?? '').split('\n').length)}
                   value={row._envText ?? ''}
@@ -846,17 +986,34 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
           ) : (
             <>
               <label className="mcp-row-field mcp-row-field-stack">
-                <span className="mcp-row-field-label">URL</span>
+                <span className="mcp-row-field-label">{t('mcp.fieldOAuthMode')}</span>
+                <select
+                  value={effectiveMcpAuthMode(row)}
+                  onChange={(e) =>
+                    onChange({
+                      authMode: e.target.value as NonNullable<McpServerConfig['authMode']>,
+                    })
+                  }
+                >
+                  <option value="none">{t('mcp.authModeNone')}</option>
+                  <option value="oauth">{t('mcp.authModeOAuth')}</option>
+                </select>
+              </label>
+              <label className="mcp-row-field mcp-row-field-stack">
+                <span className="mcp-row-field-label">{t('mcp.fieldUrl')}</span>
                 <input
                   type="text"
                   value={row.url ?? ''}
                   placeholder="https://mcp.higgsfield.ai/mcp"
-                  onChange={(e) => onChange({ url: e.target.value })}
+                  onChange={(e) => {
+                    const url = e.target.value;
+                    onChange({ url, authMode: authModeAfterUrlChange(row, url) });
+                  }}
                   spellCheck={false}
                 />
               </label>
               <label className="mcp-row-field mcp-row-field-stack">
-                <span className="mcp-row-field-label">Headers (KEY=VALUE)</span>
+                <span className="mcp-row-field-label">{t('mcp.fieldHeaders')}</span>
                 <textarea
                   rows={Math.max(2, (row._headersText ?? '').split('\n').length)}
                   value={row._headersText ?? ''}
@@ -881,7 +1038,7 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
                   <Icon name="eye" />
                 </span>
                 <span className="mcp-json-helper-toggle-text">
-                  Need help? Map your MCP server's JSON config using the example below.
+                  {t('mcp.jsonHelperToggle')}
                 </span>
               </span>
               <span className="mcp-json-helper-toggle-icon">
@@ -896,7 +1053,7 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
             {showMcpExample && (
               <div className="mcp-json-helper-example" id={helperId}>
                 <div className="mcp-json-helper-example-head">
-                  Example MCP JSON
+                  {t('mcp.jsonHelperExampleHead')}
                 </div>
                 <pre className="mcp-json-helper-code">
                   <code>
@@ -938,20 +1095,20 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
                 </pre>
                 <div className="mcp-json-helper-conversion">
                   <div>
-                    <strong>Command</strong>
+                    <strong>{t('mcp.fieldCommand')}</strong>
                     <code>npx</code>
                   </div>
                   <div>
-                    <strong>Args</strong>
+                    <strong>{t('mcp.fieldArgs')}</strong>
                     <code>-y tdesign-mcp-server@latest</code>
                   </div>
                   <div>
-                    <strong>Env</strong>
+                    <strong>{t('mcp.fieldEnvShort')}</strong>
                     <code>API_KEY = your-key-here</code>
                   </div>
                   <div>
                     <strong>HTTP / SSE</strong>
-                    <code>use url + headers instead of command / args</code>
+                    <code>{t('mcp.jsonHelperHttpNote')}</code>
                   </div>
                 </div>
               </div>
@@ -974,6 +1131,7 @@ function McpRow({ row, idx, total, template, onChange, onRemove, onMoveUp, onMov
  * reach back via postMessage (cross-origin tab opener edge cases).
  */
 function McpOAuthControl({ serverId }: { serverId: string }) {
+  const t = useT();
   const [status, setStatus] = useState<McpOAuthStatusResponse | null>(null);
   const [busy, setBusy] = useState<'idle' | 'starting' | 'awaiting' | 'disconnecting' | 'refreshing'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -1121,7 +1279,7 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
       setPendingAuthUrl(null);
       setStatus({ connected: false });
     } else {
-      setError('Disconnect failed. Check daemon logs.');
+      setError(t('mcp.disconnectFailed'));
     }
   };
 
@@ -1139,11 +1297,11 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
           <>
             <span className="mcp-oauth-dot mcp-oauth-dot-ok" aria-hidden />
             <span>
-              <strong>Connected.</strong>{' '}
+              <strong>{t('mcp.connected')}</strong>{' '}
               {expiresLabel ? (
-                <span className="hint">Token expires {expiresLabel}.</span>
+                <span className="hint">{t('mcp.tokenExpires', { time: expiresLabel })}</span>
               ) : (
-                <span className="hint">Non-expiring token.</span>
+                <span className="hint">{t('mcp.nonExpiringToken')}</span>
               )}
             </span>
           </>
@@ -1151,11 +1309,9 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
           <>
             <span className="mcp-oauth-dot mcp-oauth-dot-pending" aria-hidden />
             <span>
-              <strong>Waiting for authorization…</strong>{' '}
+              <strong>{t('mcp.waitingForAuthorization')}</strong>{' '}
               <span className="hint">
-                Approve in the browser tab that opened. We'll catch the callback
-                automatically — or click Refresh below if you completed it
-                already.
+                {t('mcp.approveInBrowserHint')}
               </span>
             </span>
           </>
@@ -1163,9 +1319,9 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
           <>
             <span className="mcp-oauth-dot" aria-hidden />
             <span>
-              <strong>Not connected.</strong>{' '}
+              <strong>{t('mcp.notConnected')}</strong>{' '}
               <span className="hint">
-                Click Connect to grant Open Design access via the provider's OAuth flow.
+                {t('mcp.clickConnectHint')}
               </span>
             </span>
           </>
@@ -1180,24 +1336,24 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
               className="primary"
               onClick={onConnect}
               disabled={busy !== 'idle' && busy !== 'refreshing'}
-              title="Reauthenticate (replaces the existing token)"
+              title={t('mcp.reauthenticateTitle')}
             >
-              {busy === 'starting' || busy === 'awaiting' ? 'Connecting…' : 'Reconnect'}
+              {busy === 'starting' || busy === 'awaiting' ? t('mcp.connecting') : t('mcp.reconnect')}
             </button>
             <button
               type="button"
               onClick={onRefreshStatus}
               disabled={busy !== 'idle' && busy !== 'refreshing'}
-              title="Re-check token status against the daemon"
+              title={t('mcp.recheckTokenTitle')}
             >
-              {busy === 'refreshing' ? 'Checking…' : 'Refresh'}
+              {busy === 'refreshing' ? t('mcp.checking') : t('mcp.refresh')}
             </button>
             <button
               type="button"
               onClick={onDisconnect}
               disabled={busy !== 'idle' && busy !== 'refreshing'}
             >
-              {busy === 'disconnecting' ? 'Disconnecting…' : 'Disconnect'}
+              {busy === 'disconnecting' ? t('mcp.disconnecting') : t('mcp.disconnect')}
             </button>
           </>
         ) : isAwaiting ? (
@@ -1207,12 +1363,12 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
               className="primary"
               onClick={onRefreshStatus}
               disabled={busy === 'refreshing'}
-              title="I've completed authorization — check connection status now"
+              title={t('mcp.completedAuthTitle')}
             >
-              {busy === 'refreshing' ? 'Checking…' : 'I\u2019ve approved — Refresh'}
+              {busy === 'refreshing' ? t('mcp.checking') : t('mcp.approvedRefresh')}
             </button>
             <button type="button" onClick={onCancelPending}>
-              Cancel
+              {t('common.cancel')}
             </button>
           </>
         ) : (
@@ -1222,7 +1378,7 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
             onClick={onConnect}
             disabled={busy !== 'idle'}
           >
-            {busy === 'starting' ? 'Starting…' : 'Connect'}
+            {busy === 'starting' ? t('mcp.starting') : t('mcp.connect')}
           </button>
         )}
       </div>
@@ -1230,14 +1386,14 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
       {pendingAuthUrl && !connected ? (
         <div className="mcp-oauth-fallback">
           <span className="hint">
-            Browser didn't open?{' '}
+            {t('mcp.browserDidntOpen')}{' '}
             <a
               href={pendingAuthUrl}
               target="_blank"
               rel="noreferrer noopener"
               className="md-link"
             >
-              Open authorization page
+              {t('mcp.openAuthorizationPage')}
             </a>
             .
           </span>
@@ -1245,6 +1401,77 @@ function McpOAuthControl({ serverId }: { serverId: string }) {
       ) : null}
 
       {error ? <div className="mcp-oauth-error">{error}</div> : null}
+    </div>
+  );
+}
+
+/**
+ * Renders a compact two-line banner showing which installed CLI agents
+ * receive the user's external MCP servers at spawn time and which do not.
+ * The truth source is the daemon `/api/agents` payload — every runtime def
+ * carries an `externalMcpInjection` discriminator (one of
+ * `claude-mcp-json` / `acp-merge` / `opencode-env-content`, or undefined
+ * when no native injection is wired yet).
+ *
+ * The banner replaces the previous silent-failure UX from issue #2142:
+ * users were configuring servers under OpenCode / Codex / Gemini and
+ * never learning the daemon never forwarded them to the agent process.
+ * Rendered above the picker so it is the first thing the user reads.
+ */
+function McpAgentSupportBanner({ agents }: { agents: AgentInfo[] }) {
+  const t = useT();
+  // Empty payload = either still loading or daemon unreachable. Either
+  // way, render nothing — the error banner below already covers the
+  // "daemon unreachable" path and we don't want to flash an empty hint
+  // during the initial fetch.
+  if (agents.length === 0) return null;
+  // `/api/agents` returns every runtime def the daemon knows about,
+  // including CLIs the user hasn't installed (those carry
+  // `available: false`). Splitting the full catalog into "Forwarded to /
+  // Not forwarded to" would mention adapters the user can't even launch,
+  // which is misleading. Scope the banner to installed CLIs only.
+  const installed = agents.filter((a) => a.available && isVisibleLocalCliAgent(a));
+  if (installed.length === 0) return null;
+  const supported = installed.filter(
+    (a) => typeof a.externalMcpInjection === 'string',
+  );
+  const unsupported = installed.filter(
+    (a) => !a.externalMcpInjection,
+  );
+  if (supported.length === 0 && unsupported.length === 0) return null;
+  // ACP adapters (Hermes / Kimi / Kilo / Kiro / Vibe / Devin) currently
+  // accept stdio MCP servers only — `buildAcpMcpServers()` in
+  // `apps/daemon/src/mcp-config.ts` filters to `transport === 'stdio'`
+  // because the ACP `mcpServers` descriptor itself has no slot for
+  // HTTP / SSE entries. Tag those runtimes inline so the banner does
+  // not silently claim full forwarding for HTTP MCP servers, which
+  // would re-introduce the very silent-failure UX we are removing.
+  const renderNames = (list: AgentInfo[]) =>
+    list
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((a) =>
+        a.externalMcpInjection === 'acp-merge'
+          ? `${a.name} (stdio only)`
+          : a.name,
+      )
+      .join(' · ');
+  const hasAcpSupported = supported.some(
+    (a) => a.externalMcpInjection === 'acp-merge',
+  );
+  return (
+    <div className="mcp-agent-support">
+      {supported.length > 0 ? (
+        <p className="hint mcp-agent-support-line">
+          <strong>{t('mcpClient.forwardedToLabel')}</strong> {renderNames(supported)}.
+          {hasAcpSupported ? <> {t('mcpClient.forwardedAcpNote')}</> : null}
+        </p>
+      ) : null}
+      {unsupported.length > 0 ? (
+        <p className="hint mcp-agent-support-line mcp-agent-support-unsupported">
+          <strong>{t('mcpClient.notForwardedToLabel')}</strong> {renderNames(unsupported)}. {t('mcpClient.notForwardedNote')}
+        </p>
+      ) : null}
     </div>
   );
 }

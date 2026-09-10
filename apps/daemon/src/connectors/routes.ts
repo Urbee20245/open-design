@@ -2,7 +2,7 @@ import net from 'node:net';
 
 import type { Express, Request, RequestHandler, Response } from 'express';
 
-import type { ToolTokenGrant } from '../tool-tokens.js';
+import { checkConnectorAccess, type ToolTokenGrant } from '../tool-tokens.js';
 import { validateBoundedJsonObject } from '../live-artifacts/schema.js';
 import { executeConnectorTool, listConnectorTools } from '../tools/connectors.js';
 import { readComposioConfig, readPublicComposioConfig, writeComposioConfig } from './composio-config.js';
@@ -14,7 +14,9 @@ type ConnectorApiErrorCode =
   | 'FORBIDDEN'
   | 'VALIDATION_FAILED'
   | 'CONNECTOR_NOT_FOUND'
+  | 'CONNECTOR_AUTH_CONFIG_REQUIRED'
   | 'CONNECTOR_NOT_CONNECTED'
+  | 'CONNECTOR_NOT_GRANTED'
   | 'CONNECTOR_DISABLED'
   | 'CONNECTOR_TOOL_NOT_FOUND'
   | 'CONNECTOR_SAFETY_DENIED'
@@ -128,9 +130,17 @@ function parsePositiveIntegerHeader(value: string | null): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
-async function readComposioLogoBody(response: globalThis.Response): Promise<Buffer | null> {
+async function readComposioLogoBody(
+  response: globalThis.Response,
+  controller: AbortController,
+): Promise<Buffer | null> {
   const contentLength = parsePositiveIntegerHeader(response.headers.get('content-length'));
-  if (contentLength !== null && contentLength > COMPOSIO_LOGO_MAX_BYTES) return null;
+  if (contentLength !== null && contentLength > COMPOSIO_LOGO_MAX_BYTES) {
+    // Abort so the unread response body is torn down instead of leaving the
+    // upstream connection occupied until GC.
+    controller.abort();
+    return null;
+  }
 
   const reader = response.body?.getReader();
   if (!reader) {
@@ -140,13 +150,26 @@ async function readComposioLogoBody(response: globalThis.Response): Promise<Buff
 
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    totalBytes += value.byteLength;
-    if (totalBytes > COMPOSIO_LOGO_MAX_BYTES) return null;
-    chunks.push(value);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > COMPOSIO_LOGO_MAX_BYTES) {
+        controller.abort(); // stop pulling more bytes from the upstream logo host
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    // Release the upstream connection instead of leaving the body half-read
+    // until GC (matches readBodyCapped in plugin-asset-cache.ts).
+    try {
+      await reader.cancel();
+    } catch {
+      // reader already closed / errored — nothing to release
+    }
   }
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), totalBytes);
 }
@@ -196,8 +219,13 @@ async function fetchComposioLogo(slug: string, theme: 'light' | 'dark'): Promise
         headers: { accept: 'image/avif,image/webp,image/apng,image/png,image/jpeg' },
         signal: controller.signal,
       });
-      if (!response.ok) return null;
-      const body = await readComposioLogoBody(response);
+      if (!response.ok) {
+        // Discard the error-response body so a run of misses (e.g. 404s for
+        // unknown slugs) can't exhaust reusable upstream connections.
+        controller.abort();
+        return null;
+      }
+      const body = await readComposioLogoBody(response, controller);
       if (!body) return null;
       const contentType = normalizeImageContentType(response.headers.get('content-type'));
       if (!contentType) return null;
@@ -291,7 +319,7 @@ function renderConnectorConnectedHtml(connectorId: string): string {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>${connectorLabelHtml} connected · Open Design</title>
+    <title>${connectorLabelHtml} connected · OpenDesign</title>
     <style>
       :root {
         --bg: #faf9f7;
@@ -444,9 +472,9 @@ function renderConnectorConnectedHtml(connectorId: string): string {
   </head>
   <body>
     <main aria-labelledby="callback-title">
-      <div class="chrome" aria-label="Open Design">
+      <div class="chrome" aria-label="OpenDesign">
         <span class="brand-mark" aria-hidden="true">OD</span>
-        <span class="brand-title">Open Design</span>
+        <span class="brand-title">OpenDesign</span>
       </div>
       <section class="content">
         <div class="status-icon" aria-hidden="true">
@@ -456,7 +484,7 @@ function renderConnectorConnectedHtml(connectorId: string): string {
         </div>
         <div>
           <h1 id="callback-title">${connectorLabelHtml} connected</h1>
-          <p>Your connector is ready to use in Open Design.</p>
+          <p>Your connector is ready to use in OpenDesign.</p>
         </div>
         <div class="summary" role="status">
           <span class="summary-label">
@@ -478,7 +506,7 @@ function renderConnectorConnectedHtml(connectorId: string): string {
         const hint = document.getElementById('auto-close-hint');
         function showManualCloseHint() {
           closeButton.textContent = 'Close this tab manually';
-          hint.textContent = 'Your browser blocked automatic closing. You can close this tab and return to Open Design.';
+          hint.textContent = 'Your browser blocked automatic closing. You can close this tab and return to OpenDesign.';
         }
         function hasLiveOpener() {
           try {
@@ -511,10 +539,10 @@ function renderConnectorConnectedHtml(connectorId: string): string {
             window.opener.postMessage(message, '*');
             window.setTimeout(requestClose, 900);
           } else {
-            hint.textContent = 'You can close this tab and return to Open Design.';
+            hint.textContent = 'You can close this tab and return to OpenDesign.';
           }
         } catch {
-          hint.textContent = 'You can close this tab and return to Open Design.';
+          hint.textContent = 'You can close this tab and return to OpenDesign.';
         }
         closeButton.addEventListener('click', requestClose);
       })();
@@ -588,7 +616,7 @@ export function registerConnectorRoutes(app: Express, options: RegisterConnector
     }
   });
 
-  app.get('/api/connectors/:connectorId', async (req: Request, res: Response) => {
+  app.get('/api/connectors/:connectorId', async (req: Request<{ connectorId: string }>, res: Response) => {
     try {
       const connectorId = req.params.connectorId;
       if (!connectorId) return options.sendApiError(res, 400, 'CONNECTOR_NOT_FOUND', 'connectorId is required');
@@ -624,7 +652,7 @@ export function registerConnectorRoutes(app: Express, options: RegisterConnector
     }
   });
 
-  app.post('/api/connectors/:connectorId/connect', requireLocalDaemonRequest, async (req: Request, res: Response) => {
+  app.post('/api/connectors/:connectorId/connect', requireLocalDaemonRequest, async (req: Request<{ connectorId: string }>, res: Response) => {
     try {
       const connectorId = req.params.connectorId;
       if (!connectorId) return options.sendApiError(res, 400, 'CONNECTOR_NOT_FOUND', 'connectorId is required');
@@ -652,7 +680,7 @@ export function registerConnectorRoutes(app: Express, options: RegisterConnector
     }
   });
 
-  app.get('/api/connectors/oauth/callback/:connectorId', async (req: Request, res: Response) => {
+  app.get('/api/connectors/oauth/callback/:connectorId', async (req: Request<{ connectorId: string }>, res: Response) => {
     try {
       const connectorId = req.params.connectorId;
       if (!connectorId) return options.sendApiError(res, 400, 'CONNECTOR_NOT_FOUND', 'connectorId is required');
@@ -673,7 +701,7 @@ export function registerConnectorRoutes(app: Express, options: RegisterConnector
     }
   });
 
-  app.post('/api/connectors/:connectorId/authorization/cancel', requireLocalDaemonRequest, async (req: Request, res: Response) => {
+  app.post('/api/connectors/:connectorId/authorization/cancel', requireLocalDaemonRequest, async (req: Request<{ connectorId: string }>, res: Response) => {
     try {
       const connectorId = req.params.connectorId;
       if (!connectorId) return options.sendApiError(res, 400, 'CONNECTOR_NOT_FOUND', 'connectorId is required');
@@ -683,7 +711,7 @@ export function registerConnectorRoutes(app: Express, options: RegisterConnector
     }
   });
 
-  app.delete('/api/connectors/:connectorId/connection', requireLocalDaemonRequest, async (req: Request, res: Response) => {
+  app.delete('/api/connectors/:connectorId/connection', requireLocalDaemonRequest, async (req: Request<{ connectorId: string }>, res: Response) => {
     try {
       const connectorId = req.params.connectorId;
       if (!connectorId) return options.sendApiError(res, 400, 'CONNECTOR_NOT_FOUND', 'connectorId is required');
@@ -756,6 +784,18 @@ export function registerConnectorRoutes(app: Express, options: RegisterConnector
       }
       if (typeof toolName !== 'string' || toolName.length === 0) {
         options.sendApiError(res, 400, 'BAD_REQUEST', 'toolName is required');
+        return;
+      }
+
+      // Plan §3.A3 / spec §9: re-validate the plugin connector capability
+      // gate on every call so a token replacement attack never bypasses
+      // the §5.3 rule. When the grant has no plugin context the gate is
+      // a no-op.
+      const connectorGate = checkConnectorAccess(grant, connectorId);
+      if (!connectorGate.ok) {
+        options.sendApiError(res, 403, 'CONNECTOR_NOT_GRANTED', connectorGate.reason, {
+          details: { connectorId },
+        });
         return;
       }
       const inputValidation = validateBoundedJsonObject(input ?? {}, 'input');

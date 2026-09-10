@@ -1,13 +1,19 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type { ReactNode } from 'react';
+import { useLayoutEffect, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ProjectView } from '../../src/components/ProjectView';
-import { streamMessage } from '../../src/providers/anthropic';
-import type { StreamHandlers } from '../../src/providers/anthropic';
-import { patchPreviewCommentStatus, writeProjectTextFile } from '../../src/providers/registry';
+import { streamViaDaemon } from '../../src/providers/daemon';
+import type { DaemonStreamOptions } from '../../src/providers/daemon';
+import {
+  fetchProjectFilePreview,
+  fetchProjectFileText,
+  fetchProjectFiles,
+  patchPreviewCommentStatus,
+  writeProjectTextFile,
+} from '../../src/providers/registry';
 import { listMessages, saveMessage } from '../../src/state/projects';
 import { playSound } from '../../src/utils/notifications';
 import type {
@@ -24,7 +30,10 @@ import type {
 } from '../../src/types';
 
 const chatPaneMockState = vi.hoisted(() => ({
+  attachments: [] as ChatAttachment[],
   commentAttachments: [] as ChatCommentAttachment[],
+  fireResizeObserverOnFocusedLayout: false,
+  resizeObserverCallbacks: [] as ResizeObserverCallback[],
 }));
 
 vi.mock('../../src/router', () => ({
@@ -38,6 +47,8 @@ vi.mock('../../src/providers/anthropic', () => ({
 vi.mock('../../src/providers/daemon', () => ({
   fetchChatRunStatus: vi.fn(),
   listActiveChatRuns: vi.fn().mockResolvedValue([]),
+  listProjectRuns: vi.fn().mockResolvedValue([]),
+  publishDaemonRunFinishedEvent: vi.fn(),
   reattachDaemonRun: vi.fn(),
   streamViaDaemon: vi.fn(),
 }));
@@ -65,6 +76,8 @@ vi.mock('../../src/providers/registry', async () => {
     deletePreviewComment: vi.fn(),
     fetchDesignSystem: vi.fn().mockResolvedValue(null),
     fetchLiveArtifacts: vi.fn().mockResolvedValue([]),
+    fetchProjectFilePreview: vi.fn().mockResolvedValue(null),
+    fetchProjectFileText: vi.fn().mockResolvedValue(null),
     fetchPreviewComments: vi.fn().mockResolvedValue([]),
     fetchProjectFiles: vi.fn().mockResolvedValue([]),
     fetchSkill: vi.fn().mockResolvedValue(null),
@@ -109,7 +122,37 @@ vi.mock('../../src/components/AvatarMenu', () => ({
 }));
 
 vi.mock('../../src/components/FileWorkspace', () => ({
-  FileWorkspace: () => <div data-testid="file-workspace" />,
+  DESIGN_SYSTEM_TAB: '__design_system__',
+  FileWorkspace: ({
+    openRequest,
+    focusMode = false,
+    onFocusModeChange,
+  }: {
+    openRequest?: { name: string; nonce: number } | null;
+    focusMode?: boolean;
+    onFocusModeChange?: (focused: boolean) => void;
+  }) => {
+    useLayoutEffect(() => {
+      if (!focusMode || !chatPaneMockState.fireResizeObserverOnFocusedLayout) return;
+      for (const callback of chatPaneMockState.resizeObserverCallbacks) {
+        callback([], {} as ResizeObserver);
+      }
+    }, [focusMode]);
+
+    return (
+      <div data-testid="file-workspace" data-open-request-name={openRequest?.name ?? ''}>
+        {focusMode ? (
+          <button
+            type="button"
+            data-testid="workspace-focus-toggle"
+            onClick={() => onFocusModeChange?.(false)}
+          >
+            show chat
+          </button>
+        ) : null}
+      </div>
+    );
+  },
 }));
 
 vi.mock('../../src/components/Loading', () => ({
@@ -120,7 +163,11 @@ vi.mock('../../src/components/ChatPane', () => ({
   ChatPane: ({
     messages,
     onSend,
+    onRetry,
     error,
+    projectHeader,
+    onCollapse,
+    collapseControlLifted,
   }: {
     messages: ChatMessage[];
     onSend: (
@@ -128,13 +175,45 @@ vi.mock('../../src/components/ChatPane', () => ({
       attachments: ChatAttachment[],
       commentAttachments: ChatCommentAttachment[],
     ) => void;
+    onRetry?: (assistantMessage: ChatMessage) => void;
     error?: string | null;
-  }) => (
-    <div>
-      {error ? <div>{error}</div> : null}
-      <button type="button" onClick={() => onSend('Create a login page', [], chatPaneMockState.commentAttachments)}>
+    projectHeader?: ReactNode;
+    onCollapse?: () => void;
+    collapseControlLifted?: boolean;
+  }) => {
+    const lastMessage = messages[messages.length - 1];
+    const retryMessage =
+      lastMessage?.role === 'assistant' &&
+      (
+        lastMessage.runStatus === 'failed' ||
+        lastMessage.resultDeliveryState === 'no_result' ||
+        lastMessage.resultDeliveryState === 'delivery_failed'
+      )
+      ? lastMessage
+      : null;
+    return (
+      <div>
+        {projectHeader}
+        {error ? <div>{error}</div> : null}
+        {error && retryMessage && onRetry ? (
+          <button type="button" onClick={() => onRetry(retryMessage)}>
+            retry
+          </button>
+        ) : null}
+      <button
+        type="button"
+        onClick={() => onSend('Create a login page', chatPaneMockState.attachments, chatPaneMockState.commentAttachments)}
+      >
         send
       </button>
+      {/* Mirrors the real ChatPane: when the collapse control is lifted into
+          the tabs dock, the header slot renders nothing — otherwise two
+          controls would share this testid. */}
+      {collapseControlLifted ? null : (
+        <button type="button" data-testid="chat-collapse-toggle" onClick={onCollapse}>
+          collapse chat
+        </button>
+      )}
       {messages.map((message) => (
         <article key={message.id} data-testid={`message-${message.role}`}>
           <span>{message.content}</span>
@@ -147,11 +226,15 @@ vi.mock('../../src/components/ChatPane', () => ({
           ))}
         </article>
       ))}
-    </div>
-  ),
+      </div>
+    );
+  },
 }));
 
-const mockedStreamMessage = vi.mocked(streamMessage);
+const mockedStreamViaDaemon = vi.mocked(streamViaDaemon);
+const mockedFetchProjectFilePreview = vi.mocked(fetchProjectFilePreview);
+const mockedFetchProjectFileText = vi.mocked(fetchProjectFileText);
+const mockedFetchProjectFiles = vi.mocked(fetchProjectFiles);
 const mockedListMessages = vi.mocked(listMessages);
 const mockedSaveMessage = vi.mocked(saveMessage);
 const mockedWriteProjectTextFile = vi.mocked(writeProjectTextFile);
@@ -161,7 +244,7 @@ const mockedPlaySound = vi.mocked(playSound);
 const config: AppConfig = {
   mode: 'api',
   apiProtocol: 'openai',
-  apiKey: 'sk-test',
+  apiKey: 'byok-test-key',
   baseUrl: 'https://api.deepseek.com',
   model: 'deepseek-chat',
   agentId: null,
@@ -184,13 +267,24 @@ const project: Project = {
   updatedAt: 1,
 };
 
-function renderProjectView(renderProject: Project = project) {
+function renderProjectView(
+  renderProject: Project = project,
+  agents: AgentInfo[] = [
+    {
+      id: 'byok-opencode',
+      name: 'BYOK OpenCode',
+      bin: 'opencode',
+      available: true,
+      models: [],
+    } as AgentInfo,
+  ],
+) {
   return render(
     <ProjectView
       project={renderProject}
       routeFileName={null}
       config={config}
-      agents={[] as AgentInfo[]}
+      agents={agents}
       skills={[] as SkillSummary[]}
       designTemplates={[] as SkillSummary[]}
       designSystems={[] as DesignSystemSummary[]}
@@ -211,11 +305,27 @@ function renderProjectView(renderProject: Project = project) {
 
 describe('ProjectView API empty response handling', () => {
   beforeEach(() => {
+    chatPaneMockState.attachments = [];
     chatPaneMockState.commentAttachments = [];
-    mockedStreamMessage.mockReset();
+    chatPaneMockState.fireResizeObserverOnFocusedLayout = false;
+    chatPaneMockState.resizeObserverCallbacks = [];
+    mockedStreamViaDaemon.mockReset();
+    mockedFetchProjectFilePreview.mockReset();
+    mockedFetchProjectFileText.mockReset();
+    mockedFetchProjectFiles.mockReset();
+    mockedFetchProjectFilePreview.mockResolvedValue(null);
+    mockedFetchProjectFileText.mockResolvedValue(null);
+    mockedFetchProjectFiles.mockResolvedValue([]);
+    mockedWriteProjectTextFile.mockResolvedValue({
+      name: 'landing-page.html',
+      path: 'landing-page.html',
+      kind: 'html',
+      mime: 'text/html',
+      size: 1,
+      mtime: 1,
+    });
     mockedListMessages.mockClear();
     mockedSaveMessage.mockClear();
-    mockedWriteProjectTextFile.mockClear();
     mockedPatchPreviewCommentStatus.mockClear();
     mockedPlaySound.mockClear();
   });
@@ -227,13 +337,8 @@ describe('ProjectView API empty response handling', () => {
   });
 
   it('marks an empty API completion as a soft no-output state instead of succeeded', async () => {
-    mockedStreamMessage.mockImplementation(async (
-      _cfg: AppConfig,
-      _system: string,
-      _history: ChatMessage[],
-      _signal: AbortSignal,
-      handlers: StreamHandlers,
-    ) => {
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
       handlers.onDone('');
     });
     renderProjectView();
@@ -263,12 +368,83 @@ describe('ProjectView API empty response handling', () => {
     expect(mockedPlaySound).toHaveBeenCalledWith('failure-sound');
   });
 
-  it('keeps project action entry points visible above the workspace', async () => {
+  it('retries a failed API turn without appending a duplicate user message', async () => {
+    let callCount = 0;
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
+      callCount += 1;
+      if (callCount === 1) {
+        handlers.onError(new Error('model crashed'));
+      }
+    });
     renderProjectView();
 
-    expect(screen.getByRole('toolbar', { name: 'Project actions' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Finalize design package' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Continue in CLI' })).toBeTruthy();
+    await sendTestPrompt();
+
+    await waitFor(() => expect(screen.getByText('model crashed')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'retry' }));
+
+    await waitFor(() => expect(mockedStreamViaDaemon).toHaveBeenCalledTimes(2));
+    const retryHistory = mockedStreamViaDaemon.mock.calls[1]![0].history;
+    expect(retryHistory.map((message) => `${message.role}:${message.content}`)).toEqual([
+      'user:Create a login page',
+    ]);
+    expect(
+      mockedSaveMessage.mock.calls.filter((call) => {
+        const message = call[2] as ChatMessage;
+        return message.role === 'user' && message.content === 'Create a login page';
+      }),
+    ).toHaveLength(1);
+  });
+
+  it('renders the workspace without the removed project action toolbar', async () => {
+    renderProjectView();
+
+    expect(screen.getByTestId('file-workspace')).toBeTruthy();
+    expect(screen.queryByRole('toolbar', { name: 'Project actions' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Finalize design package' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Continue in CLI' })).toBeNull();
+  });
+
+  it('keeps an empty project workspace visible across repeated chat collapse cycles', async () => {
+    class MockResizeObserver implements ResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        chatPaneMockState.resizeObserverCallbacks.push(callback);
+      }
+
+      disconnect() {}
+      observe() {}
+      unobserve() {}
+    }
+
+    vi.stubGlobal('ResizeObserver', MockResizeObserver);
+    chatPaneMockState.fireResizeObserverOnFocusedLayout = true;
+    renderProjectView();
+
+    await waitFor(() => expect(chatPaneMockState.resizeObserverCallbacks.length).toBeGreaterThan(0));
+
+    for (let round = 0; round < 3; round += 1) {
+      fireEvent.click(screen.getByTestId('chat-collapse-toggle'));
+
+      const split = document.querySelector<HTMLDivElement>('.split');
+      expect(split).not.toBeNull();
+      expect(split?.classList.contains('split-focus')).toBe(true);
+      expect(screen.getByTestId('file-workspace')).toBeTruthy();
+      expect(screen.getByTestId('workspace-focus-toggle')).toBeTruthy();
+      expect(split?.style.getPropertyValue('--project-chat-panel-width')).toBe('');
+      expect(split?.style.getPropertyValue('--project-chat-handle-width')).toBe('');
+      expect(split?.style.getPropertyValue('--project-workspace-panel-track')).toBe('');
+
+      const chatSlot = split?.querySelector<HTMLDivElement>('.split-chat-slot');
+      expect(chatSlot).not.toBeNull();
+      fireEvent.transitionEnd(split!, { propertyName: '--project-chat-panel-width' });
+      await waitFor(() => expect(chatSlot).toHaveAttribute('aria-hidden', 'true'));
+      expect(chatSlot).not.toHaveAttribute('hidden');
+
+      fireEvent.click(screen.getByTestId('workspace-focus-toggle'));
+      expect(split?.classList.contains('split-focus')).toBe(false);
+      expect(chatSlot).not.toHaveAttribute('aria-hidden');
+    }
   });
 
   it('marks attached saved comments as failed when an API completion has no output', async () => {
@@ -287,13 +463,8 @@ describe('ProjectView API empty response handling', () => {
         source: 'saved-comment',
       },
     ];
-    mockedStreamMessage.mockImplementation(async (
-      _cfg: AppConfig,
-      _system: string,
-      _history: ChatMessage[],
-      _signal: AbortSignal,
-      handlers: StreamHandlers,
-    ) => {
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
       handlers.onDone('');
     });
     renderProjectView();
@@ -301,11 +472,17 @@ describe('ProjectView API empty response handling', () => {
     await sendTestPrompt();
 
     await waitFor(() => {
+      // `patchPreviewCommentStatus` takes the acting workspace context as a
+      // fifth argument (1c15574c2), so the daemon can authorize the comment
+      // mutation. This harness has no cloud identity, so it is `null` — but the
+      // argument must still be matched: a four-argument matcher cannot match a
+      // five-argument call at all.
       expect(mockedPatchPreviewCommentStatus).toHaveBeenCalledWith(
         project.id,
         'conv-project-1',
         'comment-1',
         'failed',
+        null,
       );
     });
     await waitFor(() => {
@@ -316,14 +493,12 @@ describe('ProjectView API empty response handling', () => {
     });
   });
 
-  it('keeps normal API text completions on the succeeded path', async () => {
-    mockedStreamMessage.mockImplementation(async (
-      _cfg: AppConfig,
-      _system: string,
-      _history: ChatMessage[],
-      _signal: AbortSignal,
-      handlers: StreamHandlers,
-    ) => {
+  it('keeps a text-only successful Design run as a report-only success', async () => {
+    // Report-only turns (image analysis, audits) legitimately end with prose
+    // and zero produced files (#5714, #5718). They must not be downgraded to
+    // ARTIFACT_NOT_FOUND.
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
       handlers.onDelta('hello');
       handlers.onDone('hello');
     });
@@ -333,19 +508,178 @@ describe('ProjectView API empty response handling', () => {
 
     await waitFor(() => expect(screen.getAllByText('hello').length).toBeGreaterThan(0));
     await waitFor(() => {
-      expect(hasSavedAssistantMessage((message) => message.runStatus === 'succeeded')).toBe(true);
+      expect(
+        hasSavedAssistantMessage(
+          (message) =>
+            message.runStatus === 'succeeded' &&
+            message.resultDeliveryState === undefined &&
+            message.producedFiles !== undefined &&
+            message.events?.some(
+              (event) => event.kind === 'status' && event.code === 'ARTIFACT_NOT_FOUND',
+            ) !== true,
+        ),
+      ).toBe(true);
     });
-    expect(screen.queryByText(/provider ended the request/i)).toBeNull();
+    expect(screen.queryByText(/without producing a deliverable project file/i)).toBeNull();
   });
 
-  it('plays the success sound for API completions that become succeeded after starting without runStatus', async () => {
-    mockedStreamMessage.mockImplementation(async (
-      _cfg: AppConfig,
-      _system: string,
-      _history: ChatMessage[],
-      _signal: AbortSignal,
-      handlers: StreamHandlers,
-    ) => {
+  it('records no_result when a Design run attempted file writes that never landed', async () => {
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
+      handlers.onAgentEvent({
+        kind: 'tool_use',
+        id: 'write-1',
+        name: 'Write',
+        input: { file_path: 'index.html', content: '<!doctype html>' },
+      });
+      handlers.onDelta('hello');
+      handlers.onDone('hello');
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(screen.getAllByText('hello').length).toBeGreaterThan(0));
+    await waitFor(() => {
+      expect(
+        hasSavedAssistantMessage(
+          (message) =>
+            message.runStatus === 'succeeded' &&
+            message.resultDeliveryState === 'no_result' &&
+            message.events?.some(
+              (event) =>
+                event.kind === 'status' &&
+                event.label === 'error' &&
+                event.code === 'ARTIFACT_NOT_FOUND',
+            ) === true,
+        ),
+      ).toBe(true);
+    });
+    expect(
+      screen.getAllByText(/without producing a deliverable project file/i).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('passes attached document paths and preview context to BYOK OpenCode runs', async () => {
+    chatPaneMockState.attachments = [
+      { path: 'brief.docx', name: 'brief.docx', kind: 'file', size: 1024 },
+    ];
+    mockedFetchProjectFiles.mockResolvedValue([
+      {
+        name: 'brief.docx',
+        path: 'brief.docx',
+        kind: 'document',
+        mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        size: 1024,
+        mtime: 1,
+      },
+    ] as never);
+    mockedFetchProjectFilePreview.mockResolvedValue({
+      kind: 'document',
+      title: 'brief.docx',
+      sections: [
+        {
+          title: 'Document',
+          lines: ['Hello world', 'Second line'],
+        },
+      ],
+    } as never);
+
+    let capturedHistory: ChatMessage[] = [];
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers, history } = options;
+      capturedHistory = history;
+      handlers.onDelta('hello');
+      handlers.onDone('hello');
+    });
+
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(mockedStreamViaDaemon).toHaveBeenCalledTimes(1));
+    expect(mockedStreamViaDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: 'byok-opencode',
+      attachments: ['brief.docx'],
+    }));
+    expect(mockedFetchProjectFilePreview).toHaveBeenCalledWith('project-1', 'brief.docx');
+    expect(mockedFetchProjectFileText).not.toHaveBeenCalled();
+    const userMessage = capturedHistory.at(-1);
+    expect(userMessage?.role).toBe('user');
+    expect(userMessage?.content).toContain('Create a login page');
+    expect(userMessage?.content).toContain('<attached-project-files>');
+    expect(userMessage?.content).toContain('### Attachment 1: brief.docx');
+    expect(userMessage?.content).toContain('Hello world');
+    expect(userMessage?.content).toContain('Second line');
+  });
+
+  it('fails BYOK API sends before daemon routing when OpenCode is unavailable', async () => {
+    const fetchMock = vi.fn(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    renderProjectView(project, [
+      {
+        id: 'byok-opencode',
+        name: 'BYOK OpenCode',
+        bin: 'opencode',
+        available: false,
+        models: [],
+      } as AgentInfo,
+    ]);
+
+    await sendTestPrompt();
+
+    await waitFor(() =>
+      expect(screen.getAllByText(/BYOK API runs require OpenCode/i).length).toBeGreaterThan(0),
+    );
+    expect(mockedStreamViaDaemon).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      '/api/memory/extract',
+      expect.any(Object),
+    );
+  });
+
+  it('does not include saved project instructions in the BYOK system prompt', async () => {
+    const capturedOptions: { current: DaemonStreamOptions | null } = { current: null };
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
+      capturedOptions.current = options;
+      handlers.onDelta('ok');
+      handlers.onDone('ok');
+    });
+
+    renderProjectView({
+      ...project,
+      customInstructions: 'Use tabs for indentation and keep CTA copy terse.',
+    });
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(capturedOptions.current).not.toBeNull());
+    expect(capturedOptions.current?.systemPrompt).toBeUndefined();
+    const sentContent = capturedOptions.current?.history.map((message) => message.content).join('\n') ?? '';
+    expect(sentContent).not.toContain('## Custom instructions (project-level)');
+    expect(sentContent).not.toContain('Use tabs for indentation and keep CTA copy terse.');
+  });
+
+  it('does not expose the project instructions editor from the project header', async () => {
+    const view = renderProjectView();
+
+    await screen.findByTestId('project-title');
+
+    expect(screen.queryByTestId('project-instructions-add')).toBeNull();
+    expect(view.container.querySelector('.project-instructions-chip')).toBeNull();
+    expect(view.container.querySelector('.project-instructions-modal-backdrop')).toBeNull();
+  });
+
+  it('waits for delivery verification before playing the failure sound for a missing result', async () => {
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
+      handlers.onAgentEvent({
+        kind: 'tool_use',
+        id: 'write-1',
+        name: 'Write',
+        input: { file_path: 'index.html', content: '<!doctype html>' },
+      });
       handlers.onDelta('hello');
       handlers.onDone('hello');
     });
@@ -354,9 +688,16 @@ describe('ProjectView API empty response handling', () => {
     await sendTestPrompt();
 
     await waitFor(() => {
-      expect(hasSavedAssistantMessage((message) => message.runStatus === 'succeeded')).toBe(true);
+      expect(
+        hasSavedAssistantMessage(
+          (message) =>
+            message.runStatus === 'succeeded' &&
+            message.resultDeliveryState === 'no_result',
+        ),
+      ).toBe(true);
     });
-    await waitFor(() => expect(mockedPlaySound).toHaveBeenCalledWith('success-sound'));
+    await waitFor(() => expect(mockedPlaySound).toHaveBeenCalledWith('failure-sound'));
+    expect(mockedPlaySound).not.toHaveBeenCalledWith('success-sound');
   });
 
   it('keeps API artifact completions on the succeeded path even when done text is empty', async () => {
@@ -364,13 +705,8 @@ describe('ProjectView API empty response handling', () => {
       '<artifact identifier="landing-page" type="text/html" title="Landing Page">' +
       '<!doctype html><html><head><title>Landing</title></head><body><main><h1>Landing page</h1><p>Generated design artifact with enough structure to persist.</p></main></body></html>' +
       '</artifact>';
-    mockedStreamMessage.mockImplementation(async (
-      _cfg: AppConfig,
-      _system: string,
-      _history: ChatMessage[],
-      _signal: AbortSignal,
-      handlers: StreamHandlers,
-    ) => {
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
       handlers.onDelta(artifact);
       handlers.onDone('');
     });
@@ -382,11 +718,214 @@ describe('ProjectView API empty response handling', () => {
       expect(hasSavedAssistantMessage((message) => message.runStatus === 'succeeded')).toBe(true);
     });
     await waitFor(() => expect(mockedWriteProjectTextFile).toHaveBeenCalled());
+    expect(mockedWriteProjectTextFile.mock.calls[0]?.[1]).toBe('landing-page.html');
+    await waitFor(() => {
+      expect(screen.getByTestId('file-workspace').dataset.openRequestName).toBe(
+        'landing-page.html',
+      );
+    });
+    await waitFor(() => expect(mockedPlaySound).toHaveBeenCalledWith('success-sound'));
+    expect(mockedPlaySound).not.toHaveBeenCalledWith('failure-sound');
     expect(screen.queryByText(/provider ended the request/i)).toBeNull();
     expect(screen.queryByText('empty_response:deepseek-chat')).toBeNull();
   });
 
-  it('injects ElevenLabs voice options into API-mode audio project prompts', async () => {
+  it('updates an existing project file when a chat artifact explicitly identifies it', async () => {
+    const existingIndex = {
+      name: 'index.html',
+      path: 'index.html',
+      kind: 'html',
+      mime: 'text/html',
+      size: 100,
+      mtime: 1,
+    };
+    const updatedHtml =
+      '<!doctype html><html><head><title>Updated</title></head><body><main><h1>Updated home page</h1><p>Complete replacement content for the existing project entry.</p></main></body></html>';
+    mockedFetchProjectFiles.mockResolvedValue([existingIndex] as never);
+    mockedWriteProjectTextFile.mockImplementation(
+      async (_projectId, fileName) =>
+        ({
+          ...existingIndex,
+          name: fileName,
+          path: fileName,
+          mtime: 2,
+        }) as never,
+    );
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const artifact =
+        '<artifact identifier="index" type="text/html" title="Updated Home">' +
+        updatedHtml +
+        '</artifact>';
+      options.handlers.onDelta(artifact);
+      options.handlers.onDone('');
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(mockedWriteProjectTextFile).toHaveBeenCalledTimes(1));
+    expect(mockedWriteProjectTextFile.mock.calls[0]?.slice(0, 3)).toEqual([
+      'project-1',
+      'index.html',
+      updatedHtml,
+    ]);
+    await waitFor(() => {
+      expect(screen.getByTestId('file-workspace').dataset.openRequestName).toBe('index.html');
+    });
+  });
+
+  it('suffixes a title-derived artifact that collides with an existing project file', async () => {
+    const existingLandingPage = {
+      name: 'landing-page.html',
+      path: 'landing-page.html',
+      kind: 'html',
+      mime: 'text/html',
+      size: 100,
+      mtime: 1,
+    };
+    const generatedHtml =
+      '<!doctype html><html><head><title>Landing</title></head><body><main><h1>New landing page</h1><p>Complete content for a distinct generated project artifact.</p></main></body></html>';
+    mockedFetchProjectFiles.mockResolvedValue([existingLandingPage] as never);
+    mockedWriteProjectTextFile.mockImplementation(
+      async (_projectId, fileName) =>
+        ({
+          ...existingLandingPage,
+          name: fileName,
+          path: fileName,
+          mtime: 2,
+        }) as never,
+    );
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const artifact =
+        '<artifact type="text/html" title="Landing Page">' +
+        generatedHtml +
+        '</artifact>';
+      options.handlers.onDelta(artifact);
+      options.handlers.onDone('');
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(mockedWriteProjectTextFile).toHaveBeenCalledTimes(1));
+    expect(mockedWriteProjectTextFile.mock.calls[0]?.slice(0, 3)).toEqual([
+      'project-1',
+      'landing-page-2.html',
+      generatedHtml,
+    ]);
+    await waitFor(() => {
+      expect(screen.getByTestId('file-workspace').dataset.openRequestName).toBe(
+        'landing-page-2.html',
+      );
+    });
+  });
+
+  it('refuses invalid HTML instead of overwriting an explicitly identified project file', async () => {
+    mockedFetchProjectFiles.mockResolvedValue([
+      {
+        name: 'index.html',
+        path: 'index.html',
+        kind: 'html',
+        mime: 'text/html',
+        size: 100,
+        mtime: 1,
+      },
+    ] as never);
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      options.handlers.onDelta(
+        '<artifact identifier="index" type="text/html" title="Updated Home">Summary only.</artifact>',
+      );
+      options.handlers.onDone('');
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/Refused to save artifact "index"/i).length).toBeGreaterThan(0);
+    });
+    expect(mockedWriteProjectTextFile).not.toHaveBeenCalled();
+  });
+
+  it('marks an explicitly identified overwrite as failed when persistence does not deliver it', async () => {
+    const artifact =
+      '<artifact identifier="index" type="text/html" title="Updated Home">' +
+      '<!doctype html><html><head><title>Landing</title></head><body><main><h1>Landing page</h1><p>Generated design artifact with enough structure to persist.</p></main></body></html>' +
+      '</artifact>';
+    mockedFetchProjectFiles.mockResolvedValue([
+      {
+        name: 'index.html',
+        path: 'index.html',
+        kind: 'html',
+        mime: 'text/html',
+        size: 100,
+        mtime: 1,
+      },
+    ] as never);
+    mockedWriteProjectTextFile.mockResolvedValueOnce(null);
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      options.handlers.onDelta(artifact);
+      options.handlers.onDone('');
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => {
+      expect(
+        hasSavedAssistantMessage(
+          (message) =>
+            message.runStatus === 'succeeded' &&
+            message.resultDeliveryState === 'delivery_failed' &&
+            message.events?.some(
+              (event) =>
+                event.kind === 'status' &&
+                event.label === 'error' &&
+                event.code === 'ARTIFACT_NOT_FOUND',
+            ) === true,
+        ),
+      ).toBe(true);
+    });
+    expect(mockedWriteProjectTextFile.mock.calls[0]?.[1]).toBe('index.html');
+    expect(screen.getAllByText(/couldn't save artifact/i).length).toBeGreaterThan(0);
+    await waitFor(() => expect(mockedPlaySound).toHaveBeenCalledWith('failure-sound'));
+    expect(mockedPlaySound).not.toHaveBeenCalledWith('success-sound');
+  });
+
+  it('opens the real HTML page instead of saving a pointer artifact as the preview entry', async () => {
+    const realPage = {
+      name: 'worker-edition-v2.html',
+      path: 'worker-edition-v2.html',
+      kind: 'html',
+      mime: 'text/html',
+      size: 60_000,
+      mtime: 1,
+    };
+    mockedFetchProjectFiles.mockResolvedValue([realPage] as never);
+    const artifact =
+      '<artifact identifier="worker-edition-v2" type="text/html" title="合同审查报告">' +
+      '见 worker-edition-v2.html' +
+      '</artifact>';
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
+      handlers.onDelta(artifact);
+      handlers.onDone('');
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => {
+      expect(hasSavedAssistantMessage((message) => message.runStatus === 'succeeded')).toBe(true);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('file-workspace').dataset.openRequestName).toBe('worker-edition-v2.html');
+    });
+    expect(mockedWriteProjectTextFile).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Refused to save artifact/i)).toBeNull();
+  });
+
+  it('passes audio media execution policy and catalog media defaults to BYOK OpenCode runs', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === '/api/media/providers/elevenlabs/voices?limit=100') {
@@ -410,15 +949,10 @@ describe('ProjectView API empty response handling', () => {
       return Response.json({});
     });
     vi.stubGlobal('fetch', fetchMock);
-    let capturedSystemPrompt = '';
-    mockedStreamMessage.mockImplementation(async (
-      _cfg: AppConfig,
-      system: string,
-      _history: ChatMessage[],
-      _signal: AbortSignal,
-      handlers: StreamHandlers,
-    ) => {
-      capturedSystemPrompt = system;
+    const capturedOptions: { current: DaemonStreamOptions | null } = { current: null };
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
+      capturedOptions.current = options;
       handlers.onDelta('hello');
       handlers.onDone('hello');
     });
@@ -435,18 +969,32 @@ describe('ProjectView API empty response handling', () => {
 
     await sendTestPrompt();
 
-    await waitFor(() => expect(capturedSystemPrompt).toContain('ElevenLabs voice options'));
-    expect(capturedSystemPrompt).toContain('<question-form id="elevenlabs-voice" title="Choose an ElevenLabs voice">');
-    expect(capturedSystemPrompt).toContain('"type": "select"');
-    expect(capturedSystemPrompt).toContain('"label": "Rachel — american · female"');
-    expect(capturedSystemPrompt).toContain('"value": "21m00Tcm4TlvDq8ikWAM"');
-    expect(fetchMock).toHaveBeenCalledWith(
+    await waitFor(() => expect(capturedOptions.current).not.toBeNull());
+    expect(capturedOptions.current).toEqual(expect.objectContaining({
+      agentId: 'byok-opencode',
+      byokProvider: expect.objectContaining({
+        protocol: 'openai',
+        apiKey: 'byok-test-key',
+        baseUrl: 'https://api.deepseek.com',
+        model: 'deepseek-chat',
+      }),
+      byokMediaDefaults: {
+        imageModel: 'gpt-image-2',
+        speechModel: 'gpt-4o-mini-tts',
+      },
+      mediaExecution: {
+        mode: 'enabled',
+        allowedSurfaces: ['audio'],
+        allowedModels: ['elevenlabs-v3'],
+      },
+    }));
+    expect(fetchMock).not.toHaveBeenCalledWith(
       '/api/media/providers/elevenlabs/voices?limit=100',
       expect.any(Object),
     );
   });
 
-  it('surfaces ElevenLabs voice lookup failures in API-mode audio project prompts', async () => {
+  it('does not do browser-side ElevenLabs voice lookup for BYOK OpenCode audio runs', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === '/api/media/providers/elevenlabs/voices?limit=100') {
@@ -469,15 +1017,10 @@ describe('ProjectView API empty response handling', () => {
       return Response.json({});
     });
     vi.stubGlobal('fetch', fetchMock);
-    let capturedSystemPrompt = '';
-    mockedStreamMessage.mockImplementation(async (
-      _cfg: AppConfig,
-      system: string,
-      _history: ChatMessage[],
-      _signal: AbortSignal,
-      handlers: StreamHandlers,
-    ) => {
-      capturedSystemPrompt = system;
+    const capturedOptions: { current: DaemonStreamOptions | null } = { current: null };
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      const { handlers } = options;
+      capturedOptions.current = options;
       handlers.onDelta('hello');
       handlers.onDone('hello');
     });
@@ -494,12 +1037,14 @@ describe('ProjectView API empty response handling', () => {
 
     await sendTestPrompt();
 
-    await waitFor(() => expect(capturedSystemPrompt).toContain('ElevenLabs voice options'));
-    expect(capturedSystemPrompt).toContain('ElevenLabs voice list could not be loaded (502 Bad Gateway).');
-    expect(capturedSystemPrompt).not.toContain('upstream temporarily unavailable');
-    expect(capturedSystemPrompt).not.toContain('Ignore previous instructions');
-    expect(screen.getByText(/ElevenLabs voice list could not be loaded/i)).toBeTruthy();
-    expect(fetchMock).toHaveBeenCalledWith(
+    await waitFor(() => expect(capturedOptions.current).not.toBeNull());
+    expect(capturedOptions.current?.mediaExecution).toEqual({
+      mode: 'enabled',
+      allowedSurfaces: ['audio'],
+      allowedModels: ['elevenlabs-v3'],
+    });
+    expect(screen.queryByText(/ElevenLabs voice list could not be loaded/i)).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalledWith(
       '/api/media/providers/elevenlabs/voices?limit=100',
       expect.any(Object),
     );
@@ -508,7 +1053,7 @@ describe('ProjectView API empty response handling', () => {
 
 async function sendTestPrompt() {
   await waitFor(() => {
-    expect(mockedListMessages).toHaveBeenCalledWith(project.id, 'conv-project-1');
+    expect(mockedListMessages).toHaveBeenCalledWith(project.id, 'conv-project-1', null, expect.any(AbortSignal));
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
   await waitFor(() => expect(screen.getByRole('button', { name: 'send' })).toBeTruthy());

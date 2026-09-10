@@ -1,6 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
-import { useT } from '../i18n';
+import { Button } from '@open-design/components';
+import { useI18n, useT, type Locale } from '../i18n';
+import {
+  localizeSkillDescription,
+  localizeSkillName,
+} from '../i18n/content';
 import { Icon } from './Icon';
 import type { AppConfig } from '../types';
 import type { SkillSummary } from '@open-design/contracts';
@@ -13,6 +18,14 @@ import {
   updateSkill,
   type SkillFileEntry,
 } from '../providers/registry';
+import {
+  beginWorkspaceScopedRead,
+  currentWorkspaceAccountGeneration,
+  useWorkspaceContext,
+  workspaceIdentityCacheKey,
+} from '../collab/useWorkspaceContext';
+import { useWorkspaceInvalidation } from '../collab/workspace-events';
+import { useWorkspaceSnapshotActivation } from '../collab/workspace-snapshot-activation';
 
 // Functional skills only — design templates render in EntryView's
 // Templates tab and are managed under their own daemon registry. See
@@ -30,9 +43,27 @@ import {
 interface Props {
   cfg: AppConfig;
   setCfg: Dispatch<SetStateAction<AppConfig>>;
+  onSkillsRefresh?: () => Promise<void> | void;
+  /**
+   * Fires after every successful skill registry mutation so the App
+   * shell can refresh derived state and evict any preview iframe whose
+   * project depends on the affected skill — body-only edits do not move
+   * any SkillSummary field, so ProjectView's signature-based eviction
+   * cannot see them on its own.
+   */
+  onSkillsChanged?: (affectedSkillId?: string) => void;
 }
 
 type SourceFilter = 'all' | 'user' | 'built-in';
+type SkillSource = Exclude<SourceFilter, 'all'>;
+
+const SOURCE_FILTERS = ['user', 'built-in'] as const satisfies readonly SkillSource[];
+
+function getSkillSource(skill: Pick<SkillSummary, 'source'>): SkillSource {
+  // Older or alternate registry responses may omit source. Skills without
+  // explicit user ownership are built-in and should stay in that bucket.
+  return skill.source ?? 'built-in';
+}
 
 interface DraftState {
   name: string;
@@ -64,10 +95,46 @@ function parseTriggers(raw: string): string[] {
     .filter(Boolean);
 }
 
-export function SkillsSection({ cfg, setCfg }: Props) {
-  const t = useT();
+function skillMatchesSearch(skill: SkillSummary, q: string, locale: Locale): boolean {
+  if (!q) return true;
+  const hay = `${skill.name}\n${localizeSkillName(locale, skill)}\n${skill.description}\n${localizeSkillDescription(locale, skill)}\n${(skill.triggers ?? []).join(
+    ' ',
+  )}\n${skill.category ?? ''}`;
+  return hay.toLowerCase().includes(q);
+}
 
-  const [skills, setSkills] = useState<SkillSummary[]>([]);
+export function SkillsSection({ cfg, setCfg, onSkillsRefresh, onSkillsChanged }: Props) {
+  const { locale, t } = useI18n();
+  const workspaceContextState = useWorkspaceContext();
+  const { context: workspaceContext } = workspaceContextState;
+  const workspaceContextRef = useRef(workspaceContext);
+  workspaceContextRef.current = workspaceContext;
+  const accountGeneration = currentWorkspaceAccountGeneration();
+  const workspaceReadMode = workspaceContextState.identityChangePending
+    || (!workspaceContext && workspaceContextState.loading)
+    ? 'pending'
+    : workspaceContextState.failure === 'unavailable'
+      ? 'blocked'
+      : workspaceContext
+        ? 'scoped'
+        : 'headerless';
+  const workspaceCatalogIdentity = JSON.stringify([
+    accountGeneration,
+    workspaceIdentityCacheKey(workspaceContext),
+    workspaceReadMode,
+  ]);
+  const workspaceCatalogIdentityRef = useRef(workspaceCatalogIdentity);
+  workspaceCatalogIdentityRef.current = workspaceCatalogIdentity;
+  const skillsRequestGenerationRef = useRef(0);
+  const workspaceWriteBlocked = workspaceReadMode === 'pending' || workspaceReadMode === 'blocked';
+
+  const [skillsCatalog, setSkillsCatalog] = useState<{
+    identity: string | null;
+    items: SkillSummary[];
+  }>({ identity: null, items: [] });
+  const skills = skillsCatalog.identity === workspaceCatalogIdentity
+    ? skillsCatalog.items
+    : [];
   const [search, setSearch] = useState('');
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
   const [modeFilter, setModeFilter] = useState<string>('all');
@@ -97,6 +164,7 @@ export function SkillsSection({ cfg, setCfg }: Props) {
   // user can collapse a row and come back without losing progress
   // (we drop it only on Save / Cancel).
   const [draft, setDraft] = useState<DraftState>(EMPTY_DRAFT);
+  const [draftIdentity, setDraftIdentity] = useState<string | null>(null);
   const [draftError, setDraftError] = useState<string | null>(null);
   const [draftSaving, setDraftSaving] = useState(false);
 
@@ -104,88 +172,242 @@ export function SkillsSection({ cfg, setCfg }: Props) {
   // Only one skill can be in the 'confirm pending' state at a time; the
   // user clicks once to arm, twice to commit.
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  // Editing a built-in skill writes a user-owned shadow copy and hides
+  // the built-in entry from the list. Arm an inline confirmation first
+  // so the listing change doesn't feel like a silent conversion (#1378).
+  const [confirmBuiltInEditId, setConfirmBuiltInEditId] = useState<
+    string | null
+  >(null);
+
+  const previousWorkspaceIdentityRef = useRef(workspaceCatalogIdentity);
+  useEffect(() => {
+    if (previousWorkspaceIdentityRef.current === workspaceCatalogIdentity) return;
+    previousWorkspaceIdentityRef.current = workspaceCatalogIdentity;
+    setBodyById({});
+    setFilesById({});
+    setBodyLoadingId(null);
+    setFilesLoadingId(null);
+    setExpandedId(null);
+    setEditingId(null);
+    setCreating(false);
+    setDraft(EMPTY_DRAFT);
+    setDraftIdentity(null);
+    setDraftError(null);
+    setDraftSaving(false);
+    setConfirmDeleteId(null);
+    setConfirmBuiltInEditId(null);
+  }, [workspaceCatalogIdentity]);
 
   const refresh = useCallback(async () => {
-    const list = await fetchSkills();
-    setSkills(list);
+    if (workspaceReadMode === 'pending' || workspaceReadMode === 'blocked') return [];
+    const requestGeneration = ++skillsRequestGenerationRef.current;
+    const issuedGeneration = currentWorkspaceAccountGeneration();
+    const issuedIdentity = workspaceCatalogIdentity;
+    const read = beginWorkspaceScopedRead(workspaceContext);
+    const list = await fetchSkills(read.context);
+    if (
+      skillsRequestGenerationRef.current !== requestGeneration
+      || currentWorkspaceAccountGeneration() !== issuedGeneration
+      || workspaceCatalogIdentityRef.current !== issuedIdentity
+      || !read.isStillCurrent(workspaceContextRef.current)
+    ) return [];
+    setSkillsCatalog({ identity: issuedIdentity, items: list });
     return list;
-  }, []);
+  }, [workspaceCatalogIdentity, workspaceContext, workspaceReadMode]);
 
   useEffect(() => {
+    if (workspaceContext?.workspaceType === 'team') return;
     void refresh();
-  }, [refresh]);
+  }, [refresh, workspaceContext?.workspaceType]);
+
+  const handleSkillStreamActive = useWorkspaceSnapshotActivation({
+    enabled: workspaceReadMode === 'scoped' && workspaceContext?.workspaceType === 'team',
+    identity: workspaceCatalogIdentity,
+    refresh: () => { void refresh(); },
+  });
+
+  useWorkspaceInvalidation(
+    {
+      'team-resources-changed': (payload) => {
+        if (payload.resourceKind === 'skill') void refresh();
+      },
+    },
+    {
+      workspaceContext: workspaceReadMode === 'scoped' ? workspaceContext : null,
+      enabled: workspaceReadMode === 'scoped',
+      onActive: handleSkillStreamActive,
+    },
+  );
 
   const disabledSkills = useMemo(
     () => new Set(cfg.disabledSkills ?? []),
     [cfg.disabledSkills],
   );
 
+  const searchQuery = search.toLowerCase().trim();
+
+  const sourceCounts = useMemo(() => {
+    const counts = new Map<SourceFilter, number>([
+      ['all', 0],
+      ['user', 0],
+      ['built-in', 0],
+    ]);
+    for (const s of skills) {
+      if (modeFilter !== 'all' && s.mode !== modeFilter) continue;
+      if (categoryFilter !== 'all' && s.category !== categoryFilter) continue;
+      if (!skillMatchesSearch(s, searchQuery, locale)) continue;
+      counts.set('all', (counts.get('all') ?? 0) + 1);
+      const source = getSkillSource(s);
+      counts.set(source, (counts.get(source) ?? 0) + 1);
+    }
+    return counts;
+  }, [skills, modeFilter, categoryFilter, searchQuery, locale]);
+
+  const sourceCatalogCounts = useMemo(() => {
+    const counts = new Map<SkillSource, number>([
+      ['user', 0],
+      ['built-in', 0],
+    ]);
+    for (const skill of skills) {
+      const source = getSkillSource(skill);
+      counts.set(source, (counts.get(source) ?? 0) + 1);
+    }
+    return counts;
+  }, [skills]);
+
+  // Do not leave the select pointing at a source that disappeared after a
+  // refresh (for example, when the last user skill is deleted).
+  useEffect(() => {
+    if (
+      sourceFilter !== 'all'
+      && (sourceCatalogCounts.get(sourceFilter) ?? 0) === 0
+    ) {
+      setSourceFilter('all');
+    }
+  }, [sourceCatalogCounts, sourceFilter]);
+
   const modeOptions = useMemo(() => {
+    const modes = new Set(skills.map((s) => s.mode));
     const counts = new Map<string, number>();
     for (const s of skills) {
+      if (sourceFilter !== 'all' && getSkillSource(s) !== sourceFilter) continue;
+      if (categoryFilter !== 'all' && s.category !== categoryFilter) continue;
+      if (!skillMatchesSearch(s, searchQuery, locale)) continue;
       counts.set(s.mode, (counts.get(s.mode) ?? 0) + 1);
     }
-    return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
-  }, [skills]);
+    return Array.from(modes, (mode) => [mode, counts.get(mode) ?? 0] as const).sort(
+      (a, b) => a[0].localeCompare(b[0]),
+    );
+  }, [skills, sourceFilter, categoryFilter, searchQuery, locale]);
+
+  const modeAllCount = useMemo(
+    () =>
+      skills.filter((s) => {
+        if (sourceFilter !== 'all' && getSkillSource(s) !== sourceFilter)
+          return false;
+        if (categoryFilter !== 'all' && s.category !== categoryFilter)
+          return false;
+        return skillMatchesSearch(s, searchQuery, locale);
+      }).length,
+    [skills, sourceFilter, categoryFilter, searchQuery, locale],
+  );
 
   // Categories are optional per-skill metadata (`od.category` in the
   // SKILL.md frontmatter). The pill row only renders when at least one
   // skill in the listing carries one, so a project that ships only the
   // baseline functional skills doesn't see an empty filter row.
   const categoryOptions = useMemo(() => {
+    const categories = new Set(
+      skills
+        .map((s) => s.category)
+        .filter((cat): cat is string => typeof cat === 'string' && cat.length > 0),
+    );
     const counts = new Map<string, number>();
     for (const s of skills) {
       const cat = s.category;
       if (typeof cat !== 'string' || !cat) continue;
+      if (modeFilter !== 'all' && s.mode !== modeFilter) continue;
+      if (sourceFilter !== 'all' && getSkillSource(s) !== sourceFilter) continue;
+      if (!skillMatchesSearch(s, searchQuery, locale)) continue;
       counts.set(cat, (counts.get(cat) ?? 0) + 1);
     }
-    return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
-  }, [skills]);
+    return Array.from(categories, (cat) => [cat, counts.get(cat) ?? 0] as const).sort(
+      (a, b) => a[0].localeCompare(b[0]),
+    );
+  }, [skills, modeFilter, sourceFilter, searchQuery, locale]);
+
+  const categoryAllCount = useMemo(
+    () =>
+      skills.filter((s) => {
+        if (modeFilter !== 'all' && s.mode !== modeFilter) return false;
+        if (sourceFilter !== 'all' && getSkillSource(s) !== sourceFilter)
+          return false;
+        return skillMatchesSearch(s, searchQuery, locale);
+      }).length,
+    [skills, modeFilter, sourceFilter, searchQuery, locale],
+  );
 
   const filteredSkills = useMemo(() => {
-    const q = search.toLowerCase().trim();
     return skills.filter((s) => {
       if (modeFilter !== 'all' && s.mode !== modeFilter) return false;
-      if (sourceFilter !== 'all' && s.source !== sourceFilter) return false;
+      if (sourceFilter !== 'all' && getSkillSource(s) !== sourceFilter) return false;
       if (categoryFilter !== 'all' && s.category !== categoryFilter)
         return false;
-      if (!q) return true;
-      const hay = `${s.name}\n${s.description}\n${(s.triggers ?? []).join(
-        ' ',
-      )}\n${s.category ?? ''}`;
-      return hay.toLowerCase().includes(q);
+      return skillMatchesSearch(s, searchQuery, locale);
     });
-  }, [skills, modeFilter, sourceFilter, categoryFilter, search]);
+  }, [skills, modeFilter, sourceFilter, categoryFilter, searchQuery, locale]);
 
   const ensureBody = useCallback(
     async (id: string) => {
+      if (workspaceWriteBlocked) return undefined;
       if (bodyById[id] !== undefined) return bodyById[id];
+      const issuedGeneration = currentWorkspaceAccountGeneration();
+      const issuedIdentity = workspaceCatalogIdentity;
+      const read = beginWorkspaceScopedRead(workspaceContextRef.current);
       setBodyLoadingId(id);
       try {
-        const detail = await fetchSkill(id);
+        const detail = await fetchSkill(id, read.context);
+        if (
+          currentWorkspaceAccountGeneration() !== issuedGeneration
+          || workspaceCatalogIdentityRef.current !== issuedIdentity
+          || !read.isStillCurrent(workspaceContextRef.current)
+        ) return undefined;
         const body = detail?.body ?? '';
         setBodyById((cur) => ({ ...cur, [id]: body }));
         return body;
       } finally {
-        setBodyLoadingId((cur) => (cur === id ? null : cur));
+        if (workspaceCatalogIdentityRef.current === issuedIdentity) {
+          setBodyLoadingId((cur) => (cur === id ? null : cur));
+        }
       }
     },
-    [bodyById],
+    [bodyById, workspaceCatalogIdentity, workspaceWriteBlocked],
   );
 
   const ensureFiles = useCallback(
     async (id: string) => {
+      if (workspaceWriteBlocked) return undefined;
       if (filesById[id]) return filesById[id]!;
+      const issuedGeneration = currentWorkspaceAccountGeneration();
+      const issuedIdentity = workspaceCatalogIdentity;
+      const read = beginWorkspaceScopedRead(workspaceContextRef.current);
       setFilesLoadingId(id);
       try {
-        const files = await fetchSkillFiles(id);
+        const files = await fetchSkillFiles(id, read.context);
+        if (
+          currentWorkspaceAccountGeneration() !== issuedGeneration
+          || workspaceCatalogIdentityRef.current !== issuedIdentity
+          || !read.isStillCurrent(workspaceContextRef.current)
+        ) return undefined;
         setFilesById((cur) => ({ ...cur, [id]: files }));
         return files;
       } finally {
-        setFilesLoadingId((cur) => (cur === id ? null : cur));
+        if (workspaceCatalogIdentityRef.current === issuedIdentity) {
+          setFilesLoadingId((cur) => (cur === id ? null : cur));
+        }
       }
     },
-    [filesById],
+    [filesById, workspaceCatalogIdentity, workspaceWriteBlocked],
   );
 
   const toggleExpanded = useCallback(
@@ -199,48 +421,77 @@ export function SkillsSection({ cfg, setCfg }: Props) {
       // Switching rows aborts any in-flight edit on the previous row.
       setEditingId((cur) => (cur === id ? cur : null));
       setConfirmDeleteId(null);
+      setConfirmBuiltInEditId(null);
     },
     [ensureBody, ensureFiles],
   );
 
   const startCreate = useCallback(() => {
+    if (workspaceWriteBlocked) return;
     setCreating(true);
     setDraft(EMPTY_DRAFT);
+    setDraftIdentity(workspaceCatalogIdentity);
     setDraftError(null);
     setEditingId(null);
     setConfirmDeleteId(null);
-  }, []);
+    setConfirmBuiltInEditId(null);
+  }, [workspaceCatalogIdentity, workspaceWriteBlocked]);
 
   const startEdit = useCallback(
     async (skill: SkillSummary) => {
+      const issuedIdentity = workspaceCatalogIdentity;
       const body = await ensureBody(skill.id);
+      if (body === undefined || workspaceCatalogIdentityRef.current !== issuedIdentity) return;
       setDraft(summaryToDraft(skill, body ?? ''));
+      setDraftIdentity(issuedIdentity);
       setDraftError(null);
       setEditingId(skill.id);
       setExpandedId(skill.id);
       setCreating(false);
       setConfirmDeleteId(null);
+      setConfirmBuiltInEditId(null);
     },
-    [ensureBody],
+    [ensureBody, workspaceCatalogIdentity],
   );
+
+  const requestEdit = useCallback(
+    (skill: SkillSummary) => {
+      if (getSkillSource(skill) === 'built-in') {
+        setConfirmBuiltInEditId(skill.id);
+        setConfirmDeleteId(null);
+        return;
+      }
+      void startEdit(skill);
+    },
+    [startEdit],
+  );
+
+  const cancelBuiltInEdit = useCallback(() => {
+    setConfirmBuiltInEditId(null);
+  }, []);
 
   const cancelDraft = useCallback(() => {
     setDraft(EMPTY_DRAFT);
+    setDraftIdentity(null);
     setDraftError(null);
     setEditingId(null);
     setCreating(false);
   }, []);
 
   const submitDraft = useCallback(async () => {
-    if (draftSaving) return;
+    if (
+      draftSaving
+      || workspaceWriteBlocked
+      || draftIdentity !== workspaceCatalogIdentity
+    ) return;
     const name = draft.name.trim();
     const body = draft.body.trim();
     if (!name) {
-      setDraftError('Skill name is required.');
+      setDraftError(t('settings.skillsNameRequired'));
       return;
     }
     if (!body) {
-      setDraftError('Skill body is required.');
+      setDraftError(t('settings.skillsBodyRequired'));
       return;
     }
     const triggers = parseTriggers(draft.triggers);
@@ -250,12 +501,19 @@ export function SkillsSection({ cfg, setCfg }: Props) {
       body,
       triggers,
     };
+    const issuedGeneration = currentWorkspaceAccountGeneration();
+    const issuedIdentity = workspaceCatalogIdentity;
+    const issuedContext = workspaceContextRef.current;
     setDraftSaving(true);
     setDraftError(null);
     const result =
       editingId
-        ? await updateSkill(editingId, payload)
-        : await importSkill(payload);
+        ? await updateSkill(editingId, payload, issuedContext)
+        : await importSkill(payload, issuedContext);
+    if (
+      currentWorkspaceAccountGeneration() !== issuedGeneration
+      || workspaceCatalogIdentityRef.current !== issuedIdentity
+    ) return;
     setDraftSaving(false);
     if ('error' in result) {
       setDraftError(result.error.message);
@@ -263,6 +521,15 @@ export function SkillsSection({ cfg, setCfg }: Props) {
     }
     const updated = result.skill;
     await refresh();
+    if (
+      currentWorkspaceAccountGeneration() !== issuedGeneration
+      || workspaceCatalogIdentityRef.current !== issuedIdentity
+    ) return;
+    await onSkillsRefresh?.();
+    if (
+      currentWorkspaceAccountGeneration() !== issuedGeneration
+      || workspaceCatalogIdentityRef.current !== issuedIdentity
+    ) return;
     setBodyById((cur) => ({ ...cur, [updated.id]: body }));
     // Drop the cached file tree for this id so the next expand
     // re-walks the on-disk folder; SKILL.md may have been the only
@@ -276,7 +543,32 @@ export function SkillsSection({ cfg, setCfg }: Props) {
     setEditingId(null);
     setCreating(false);
     setDraft(EMPTY_DRAFT);
-  }, [draft, draftSaving, editingId, refresh]);
+    setDraftIdentity(null);
+    setFilesLoadingId(updated.id);
+    try {
+      const files = await fetchSkillFiles(updated.id, issuedContext);
+      if (
+        currentWorkspaceAccountGeneration() !== issuedGeneration
+        || workspaceCatalogIdentityRef.current !== issuedIdentity
+      ) return;
+      setFilesById((cur) => ({ ...cur, [updated.id]: files }));
+    } finally {
+      if (workspaceCatalogIdentityRef.current === issuedIdentity) {
+        setFilesLoadingId((cur) => (cur === updated.id ? null : cur));
+      }
+    }
+    onSkillsChanged?.(updated.id);
+  }, [
+    draft,
+    draftIdentity,
+    draftSaving,
+    editingId,
+    onSkillsChanged,
+    onSkillsRefresh,
+    refresh,
+    workspaceCatalogIdentity,
+    workspaceWriteBlocked,
+  ]);
 
   const armDelete = useCallback((id: string) => {
     setConfirmDeleteId(id);
@@ -288,13 +580,29 @@ export function SkillsSection({ cfg, setCfg }: Props) {
 
   const commitDelete = useCallback(
     async (id: string) => {
-      const result = await deleteSkill(id);
+      if (workspaceWriteBlocked) return;
+      const issuedGeneration = currentWorkspaceAccountGeneration();
+      const issuedIdentity = workspaceCatalogIdentity;
+      const result = await deleteSkill(id, workspaceContextRef.current);
+      if (
+        currentWorkspaceAccountGeneration() !== issuedGeneration
+        || workspaceCatalogIdentityRef.current !== issuedIdentity
+      ) return;
       if ('error' in result) {
         setDraftError(result.error.message);
         return;
       }
       setConfirmDeleteId(null);
       await refresh();
+      if (
+        currentWorkspaceAccountGeneration() !== issuedGeneration
+        || workspaceCatalogIdentityRef.current !== issuedIdentity
+      ) return;
+      await onSkillsRefresh?.();
+      if (
+        currentWorkspaceAccountGeneration() !== issuedGeneration
+        || workspaceCatalogIdentityRef.current !== issuedIdentity
+      ) return;
       setBodyById((cur) => {
         const next = { ...cur };
         delete next[id];
@@ -316,9 +624,20 @@ export function SkillsSection({ cfg, setCfg }: Props) {
       if (editingId === id) {
         setEditingId(null);
         setDraft(EMPTY_DRAFT);
+        setDraftIdentity(null);
       }
+      onSkillsChanged?.(id);
     },
-    [editingId, expandedId, refresh, setCfg],
+    [
+      editingId,
+      expandedId,
+      onSkillsChanged,
+      onSkillsRefresh,
+      refresh,
+      setCfg,
+      workspaceCatalogIdentity,
+      workspaceWriteBlocked,
+    ],
   );
 
   const toggleEnabled = useCallback(
@@ -335,91 +654,90 @@ export function SkillsSection({ cfg, setCfg }: Props) {
 
   return (
     <section className="settings-section settings-skills">
-      <div className="section-head">
-        <div>
-          <h3>{t('settings.skills')}</h3>
-          <p className="hint">{t('settings.skillsHint')}</p>
-        </div>
-        <button
-          type="button"
-          className="primary skills-add-btn"
-          onClick={startCreate}
-          data-testid="skills-new"
-        >
-          <Icon name="plus" size={13} />
-          <span>{t('settings.skillsNew')}</span>
-        </button>
-      </div>
-
-      <div className="library-toolbar">
-        <input
-          type="search"
-          className="library-search"
-          placeholder={t('settings.librarySearch')}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
-        <div className="library-filters">
-          {(['all', 'user', 'built-in'] as const).map((s) => {
-            const count =
-              s === 'all'
-                ? skills.length
-                : skills.filter((skill) => skill.source === s).length;
-            return (
-              <button
-                key={s}
-                type="button"
-                className={`filter-pill${sourceFilter === s ? ' active' : ''}`}
-                onClick={() => setSourceFilter(s)}
-              >
-                {s === 'all' ? t('settings.libraryAll') : s}
-                <span className="filter-pill-count">{count}</span>
-              </button>
-            );
-          })}
-        </div>
-        <div className="library-filters">
+      <div className="library-toolbar skills-toolbar">
+        {/* Row 1: search + New skill button */}
+        <div className="skills-toolbar-top">
+          <input
+            type="search"
+            className="library-search"
+            placeholder={t('settings.librarySearch')}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
           <button
             type="button"
-            className={`filter-pill${modeFilter === 'all' ? ' active' : ''}`}
-            onClick={() => setModeFilter('all')}
+            className="primary skills-add-btn"
+            onClick={startCreate}
+            disabled={workspaceWriteBlocked}
+            data-testid="skills-new"
           >
-            {t('settings.libraryAll')}
+            <Icon name="plus" size={14} />
+            <span>{t('settings.skillsNew')}</span>
           </button>
-          {modeOptions.map(([mode, count]) => (
-            <button
-              key={mode}
-              type="button"
-              className={`filter-pill${modeFilter === mode ? ' active' : ''}`}
-              onClick={() => setModeFilter(mode)}
-            >
-              {mode}
-              <span className="filter-pill-count">{count}</span>
-            </button>
-          ))}
         </div>
-        {categoryOptions.length > 0 ? (
-          <div className="library-filters" data-testid="skills-category-filters">
-            <button
-              type="button"
-              className={`filter-pill${categoryFilter === 'all' ? ' active' : ''}`}
-              onClick={() => setCategoryFilter('all')}
+        {/* Row 2: filter dropdowns */}
+        <div className="library-filter-selects">
+          <label className="library-filter-select">
+            <span className="library-filter-select-label">Source</span>
+            <select
+              value={sourceFilter}
+              data-active={sourceFilter !== 'all' ? 'true' : undefined}
+              onChange={(e) => setSourceFilter(e.target.value as SourceFilter)}
             >
-              {t('settings.libraryAll')}
-            </button>
-            {categoryOptions.map(([cat, count]) => (
-              <button
-                key={cat}
-                type="button"
-                className={`filter-pill${categoryFilter === cat ? ' active' : ''}`}
-                onClick={() => setCategoryFilter(cat)}
+              <option value="all">
+                {t('settings.libraryAll')} ({sourceCounts.get('all') ?? 0})
+              </option>
+              {SOURCE_FILTERS.map((s) => {
+                const count = sourceCounts.get(s) ?? 0;
+                if ((sourceCatalogCounts.get(s) ?? 0) === 0) return null;
+                return (
+                  <option key={s} value={s}>
+                    {s} ({count})
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+          <label className="library-filter-select">
+            <span className="library-filter-select-label">Type</span>
+            <select
+              value={modeFilter}
+              data-active={modeFilter !== 'all' ? 'true' : undefined}
+              onChange={(e) => setModeFilter(e.target.value)}
+            >
+              <option value="all">
+                {t('settings.libraryAll')} ({modeAllCount})
+              </option>
+              {modeOptions.map(([mode, count]) => (
+                <option key={mode} value={mode}>
+                  {mode} ({count})
+                </option>
+              ))}
+            </select>
+          </label>
+          {categoryOptions.length > 0 ? (
+            <label
+              className="library-filter-select"
+              data-testid="skills-category-filters"
+            >
+              <span className="library-filter-select-label">Category</span>
+              <select
+                value={categoryFilter}
+                data-active={categoryFilter !== 'all' ? 'true' : undefined}
+                onChange={(e) => setCategoryFilter(e.target.value)}
               >
-                {humanizeCategory(cat)}
-                <span className="filter-pill-count">{count}</span>
-              </button>
-            ))}
-          </div>
-        ) : null}
+                <option value="all">
+                  {t('settings.libraryAll')} ({categoryAllCount})
+                </option>
+                {categoryOptions.map(([cat, count]) => (
+                  <option key={cat} value={cat}>
+                    {humanizeCategory(cat)} ({count})
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+        </div>
       </div>
 
       {creating ? (
@@ -458,13 +776,16 @@ export function SkillsSection({ cfg, setCfg }: Props) {
                 files={filesById[skill.id] ?? null}
                 filesLoading={filesLoadingId === skill.id}
                 confirmDelete={confirmDeleteId === skill.id}
+                confirmBuiltInEdit={confirmBuiltInEditId === skill.id}
                 draft={isEditing ? draft : null}
                 draftError={isEditing ? draftError : null}
                 draftSaving={isEditing && draftSaving}
                 setDraft={setDraft}
                 onToggleExpanded={() => toggleExpanded(skill.id)}
                 onToggleEnabled={(e) => toggleEnabled(skill.id, e)}
-                onStartEdit={() => void startEdit(skill)}
+                onStartEdit={() => requestEdit(skill)}
+                onConfirmBuiltInEdit={() => void startEdit(skill)}
+                onCancelBuiltInEdit={cancelBuiltInEdit}
                 onArmDelete={() => armDelete(skill.id)}
                 onCancelDelete={cancelDelete}
                 onCommitDelete={() => void commitDelete(skill.id)}
@@ -489,6 +810,7 @@ interface SkillRowProps {
   files: SkillFileEntry[] | null;
   filesLoading: boolean;
   confirmDelete: boolean;
+  confirmBuiltInEdit: boolean;
   draft: DraftState | null;
   draftError: string | null;
   draftSaving: boolean;
@@ -496,6 +818,8 @@ interface SkillRowProps {
   onToggleExpanded: () => void;
   onToggleEnabled: (enabled: boolean) => void;
   onStartEdit: () => void;
+  onConfirmBuiltInEdit: () => void;
+  onCancelBuiltInEdit: () => void;
   onArmDelete: () => void;
   onCancelDelete: () => void;
   onCommitDelete: () => void;
@@ -513,6 +837,7 @@ function SkillRow({
   files,
   filesLoading,
   confirmDelete,
+  confirmBuiltInEdit,
   draft,
   draftError,
   draftSaving,
@@ -520,6 +845,8 @@ function SkillRow({
   onToggleExpanded,
   onToggleEnabled,
   onStartEdit,
+  onConfirmBuiltInEdit,
+  onCancelBuiltInEdit,
   onArmDelete,
   onCancelDelete,
   onCommitDelete,
@@ -527,8 +854,15 @@ function SkillRow({
   onSubmitEdit,
 }: SkillRowProps) {
   const t = useT();
-  const summaryName = skill.name || skill.id;
-  const canDelete = skill.source === 'user';
+  const { locale } = useI18n();
+  const summaryName = localizeSkillName(locale, skill) || skill.id;
+  const summaryDescription = localizeSkillDescription(locale, skill);
+  const isTeamMirror = skill.teamSynced === true;
+  const canDelete = getSkillSource(skill) === 'user' && !isTeamMirror;
+  // Editing a built-in skill does not modify it in place — it writes a
+  // user-owned shadow copy. Frame the affordance as creating a user override
+  // so the built-in → user transition is not a surprise.
+  const isBuiltIn = getSkillSource(skill) !== 'user';
   return (
     <div
       className={`skills-row${enabled ? '' : ' skills-row-disabled'}${
@@ -568,8 +902,8 @@ function SkillRow({
                 </span>
               ) : null}
             </span>
-            {skill.description ? (
-              <span className="skills-row-summary-desc">{skill.description}</span>
+            {summaryDescription ? (
+              <span className="skills-row-summary-desc">{summaryDescription}</span>
             ) : null}
           </span>
           <span className="skills-row-chevron" aria-hidden>
@@ -597,25 +931,29 @@ function SkillRow({
             </span>
           ) : (
             <>
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={onStartEdit}
-                title={t('settings.skillsEdit')}
-                data-testid="skills-edit"
-              >
-                <Icon name="edit" size={13} />
-              </button>
+              {!isTeamMirror ? (
+                <Button
+                  size="icon"
+                  onClick={onStartEdit}
+                  title={
+                    isBuiltIn
+                      ? t('settings.skillsOverrideCreate')
+                      : t('settings.skillsEdit')
+                  }
+                  data-testid="skills-edit"
+                >
+                  <Icon name="edit" size={14} />
+                </Button>
+              ) : null}
               {canDelete ? (
-                <button
-                  type="button"
-                  className="icon-btn"
+                <Button
+                  size="icon"
                   onClick={onArmDelete}
                   title={t('settings.skillsDelete')}
                   data-testid="skills-delete"
                 >
-                  <Icon name="close" size={13} />
-                </button>
+                  <Icon name="close" size={14} />
+                </Button>
               ) : null}
             </>
           )}
@@ -633,6 +971,34 @@ function SkillRow({
           </label>
         </div>
       </div>
+
+      {confirmBuiltInEdit ? (
+        <div
+          className="skills-edit-builtin-warning"
+          role="alert"
+          data-testid="skills-edit-builtin-warning"
+        >
+          <p>{t('settings.skillsBuiltInOverrideWarning')}</p>
+          <div className="skills-edit-builtin-actions">
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={onCancelBuiltInEdit}
+              data-testid="skills-edit-builtin-cancel"
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="button"
+              className="btn primary"
+              onClick={onConfirmBuiltInEdit}
+              data-testid="skills-edit-builtin-confirm"
+            >
+              {t('settings.skillsOverrideCreate')}
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       {expanded && !editing ? (
         <div className="skills-row-detail">
@@ -660,7 +1026,7 @@ function SkillRow({
                   >
                     <Icon
                       name={entry.kind === 'directory' ? 'folder' : 'file'}
-                      size={12}
+                      size={14}
                     />
                     <span>{leafName(entry.path)}</span>
                     {entry.kind === 'file' && typeof entry.size === 'number' ? (
@@ -678,13 +1044,18 @@ function SkillRow({
 
       {editing && draft ? (
         <SkillDraftForm
-          heading={t('settings.skillsEdit')}
+          heading={
+            isBuiltIn
+              ? t('settings.skillsOverrideCreate')
+              : t('settings.skillsEdit')
+          }
           subheading={skill.id}
           draft={draft}
           setDraft={setDraft}
           error={draftError}
           saving={draftSaving}
           isEdit
+          isBuiltInOverride={isBuiltIn}
           onCancel={onCancelEdit}
           onSubmit={onSubmitEdit}
         />
@@ -701,6 +1072,8 @@ interface SkillDraftFormProps {
   error: string | null;
   saving: boolean;
   isEdit: boolean;
+  /** Editing a built-in skill: the submit reads "Save as user override". */
+  isBuiltInOverride?: boolean;
   onCancel: () => void;
   onSubmit: () => void;
 }
@@ -713,6 +1086,7 @@ function SkillDraftForm({
   error,
   saving,
   isEdit,
+  isBuiltInOverride = false,
   onCancel,
   onSubmit,
 }: SkillDraftFormProps) {
@@ -795,7 +1169,9 @@ function SkillDraftForm({
           {saving
             ? t('settings.skillsSaving')
             : isEdit
-              ? t('settings.skillsSave')
+              ? isBuiltInOverride
+                ? t('settings.skillsOverrideSave')
+                : t('settings.skillsSave')
               : t('settings.skillsCreate')}
         </button>
       </div>
@@ -826,7 +1202,7 @@ function formatSize(bytes: number): string {
 // Frontmatter-style category slugs come in as kebab-case
 // ("image-generation"). Render them as Title Case in the filter pill so
 // the row reads as a category list rather than a raw enum dump.
-function humanizeCategory(slug: string): string {
+export function humanizeCategory(slug: string): string {
   if (!slug) return slug;
   return slug
     .split('-')

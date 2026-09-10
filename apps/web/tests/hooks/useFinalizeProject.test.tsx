@@ -2,6 +2,7 @@
 
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { WorkspaceCollabContext } from '@open-design/contracts';
 
 import {
   messageForCode,
@@ -15,6 +16,14 @@ const REQUEST = {
   maxTokens: 8192,
 };
 
+const GOOGLE_REQUEST = {
+  protocol: 'google',
+  apiKey: 'AIza-test',
+  baseUrl: 'https://generativelanguage.googleapis.com',
+  model: 'gemini-2.0-flash',
+  maxTokens: 8192,
+};
+
 const SUCCESS_BODY = {
   designMdPath: '/tmp/p1/DESIGN.md',
   bytesWritten: 4096,
@@ -25,6 +34,19 @@ const SUCCESS_BODY = {
   transcriptMessageCount: 12,
   designSystemId: 'alphatrace',
 };
+
+const WORKSPACE_CONTEXT = {
+  workspaceId: 'workspace-team',
+  workspaceType: 'team',
+  workspaceMemberId: 'member-owner',
+  role: 'owner',
+  memberStatus: 'active',
+  lifecycleState: 'active',
+  permissions: {
+    canShareProjects: true,
+    canWriteSyncedFiles: true,
+  },
+} as WorkspaceCollabContext;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -63,12 +85,45 @@ describe('useFinalizeProject', () => {
     });
   });
 
+  it('pins the exact Workspace authority on bound-project finalize requests', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(SUCCESS_BODY));
+    const { result } = renderHook(() => useFinalizeProject('p1', WORKSPACE_CONTEXT));
+
+    await act(async () => {
+      await result.current.trigger(REQUEST);
+    });
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    const headers = new Headers(init?.headers);
+    expect(headers.get('x-od-workspace-id')).toBe('workspace-team');
+    expect(headers.get('x-od-workspace-member-id')).toBe('member-owner');
+    expect(headers.get('x-od-workspace-role')).toBe('owner');
+    expect(headers.get('x-od-workspace-can-write-synced-files')).toBe('true');
+  });
+
+  it('routes provider-aware requests to the matching finalize endpoint', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
+      ...SUCCESS_BODY,
+      model: 'gemini-2.0-flash',
+    }));
+    const { result } = renderHook(() => useFinalizeProject('p1'));
+
+    await act(async () => {
+      await result.current.trigger(GOOGLE_REQUEST as any);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/api/projects/p1/finalize/google');
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual(GOOGLE_REQUEST);
+  });
+
   const ERROR_TABLE: Array<{ code: string; expected: string }> = [
     { code: 'BAD_REQUEST', expected: 'Bad request — check the API key and model.' },
     { code: 'UNAUTHORIZED', expected: 'API key was rejected. Check it in Settings.' },
     { code: 'FORBIDDEN', expected: 'Access denied by the upstream API.' },
-    { code: 'RATE_LIMITED', expected: 'Anthropic rate-limited the request. Try again in a minute.' },
-    { code: 'UPSTREAM_UNAVAILABLE', expected: 'The Anthropic API is unavailable right now.' },
+    { code: 'RATE_LIMITED', expected: 'The selected provider rate-limited the request. Try again in a minute.' },
+    { code: 'UPSTREAM_UNAVAILABLE', expected: 'The selected provider API is unavailable right now.' },
     { code: 'CONFLICT', expected: 'Another finalize is in progress for this project.' },
     { code: 'PROJECT_NOT_FOUND', expected: 'Project not found.' },
     { code: 'INTERNAL_ERROR', expected: 'Something went wrong while finalizing. Check the daemon logs.' },
@@ -130,7 +185,7 @@ describe('useFinalizeProject', () => {
 
     expect(result.current.status).toBe('error');
     expect(result.current.error?.code).toBe('UPSTREAM_UNAVAILABLE');
-    expect(result.current.error?.message).toBe('The Anthropic API is unavailable right now.');
+    expect(result.current.error?.message).toBe('The selected provider API is unavailable right now.');
     expect(result.current.error?.details).toBe(usageCapDetails);
   });
 

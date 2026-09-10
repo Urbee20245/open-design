@@ -37,10 +37,12 @@ import type { ChatMessage } from '../../src/types';
 type Geom = { scrollHeight: number; clientHeight: number; scrollTop: number };
 let geom: Geom;
 let rafCallbacks: FrameRequestCallback[] = [];
+let resizeCallbacks: ResizeObserverCallback[] = [];
 let savedDescriptors: Record<
   'scrollTop' | 'scrollHeight' | 'clientHeight',
   PropertyDescriptor | undefined
 >;
+let originalResizeObserver: typeof ResizeObserver | undefined;
 
 function isChatLog(el: HTMLElement): boolean {
   return typeof el?.classList?.contains === 'function' && el.classList.contains('chat-log');
@@ -49,9 +51,24 @@ function isChatLog(el: HTMLElement): boolean {
 beforeEach(() => {
   geom = { scrollHeight: 0, clientHeight: 0, scrollTop: 0 };
   rafCallbacks = [];
+  resizeCallbacks = [];
   vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
     rafCallbacks.push(callback);
     return rafCallbacks.length;
+  });
+  originalResizeObserver = globalThis.ResizeObserver;
+  class MockResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      resizeCallbacks.push(callback);
+    }
+    observe = vi.fn();
+    unobserve = vi.fn();
+    disconnect = vi.fn();
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    configurable: true,
+    writable: true,
+    value: MockResizeObserver,
   });
   savedDescriptors = {
     scrollTop: Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollTop'),
@@ -64,7 +81,18 @@ beforeEach(() => {
       return isChatLog(this) ? geom.scrollTop : 0;
     },
     set(this: HTMLElement, v: number) {
-      if (isChatLog(this)) geom.scrollTop = v;
+      if (!isChatLog(this)) return;
+      // The setter CLAMPS, exactly as a real scroller does: `scrollTop` can
+      // never exceed `scrollHeight - clientHeight`. Without this the fixture
+      // stores whatever was written — so `scrollTop = scrollHeight` parked the
+      // log at a position no browser can produce, and the assertions below
+      // then read "we wrote scrollHeight" rather than "we ended up at the
+      // bottom". Those are different claims, and only the second one is the
+      // behaviour these tests exist to protect.
+      geom.scrollTop = Math.min(
+        Math.max(0, v),
+        Math.max(0, geom.scrollHeight - geom.clientHeight),
+      );
     },
   });
   Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
@@ -85,6 +113,16 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   rafCallbacks = [];
+  resizeCallbacks = [];
+  if (originalResizeObserver) {
+    Object.defineProperty(globalThis, 'ResizeObserver', {
+      configurable: true,
+      writable: true,
+      value: originalResizeObserver,
+    });
+  } else {
+    delete (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver;
+  }
   for (const key of ['scrollTop', 'scrollHeight', 'clientHeight'] as const) {
     const original = savedDescriptors[key];
     if (original) {
@@ -101,13 +139,14 @@ function setGeom(partial: Partial<Geom>) {
 
 function setUserScroll(top: number) {
   geom.scrollTop = top;
-  const el = document.querySelector('.chat-log');
+  const el = document.querySelector('[data-testid="chat-log"]');
   if (el) fireEvent.scroll(el);
 }
 
 function chatPaneEl(messages: ChatMessage[], activeConversationId: string | null) {
   return (
     <ChatPane
+      projectKindForTracking="prototype"
       messages={messages}
       streaming={false}
       error={null}
@@ -140,6 +179,16 @@ async function flushFrame() {
     const callbacks = rafCallbacks;
     rafCallbacks = [];
     callbacks.forEach((callback) => callback(performance.now()));
+    await Promise.resolve();
+  });
+}
+
+async function triggerResize() {
+  await act(async () => {
+    const callbacks = [...resizeCallbacks];
+    callbacks.forEach((callback) =>
+      callback([], {} as ResizeObserver),
+    );
     await Promise.resolve();
   });
 }
@@ -182,6 +231,26 @@ describe('chat scroll behavior', () => {
     expect(geom.scrollTop).toBe(510);
   });
 
+  it('keeps following the latest content when the pinned chat DOM grows after render', async () => {
+    setGeom({ scrollHeight: 1000, clientHeight: 400, scrollTop: 0 });
+    renderChatPane(sampleMessages);
+    await flushFrame();
+
+    // The initial bottom-pin lands on the real ceiling, 1000 - 400. (It asks
+    // for `scrollHeight`; the scroller clamps, here and in a browser alike.)
+    expect(geom.scrollTop).toBe(600);
+
+    // A message body can grow after the messages effect has already run
+    // (markdown/tool rows/forms/images/layout). If the user was pinned to
+    // the bottom, that DOM resize must still carry them to the latest turn:
+    // the ceiling moved 600 -> 800 and they have to move with it.
+    setGeom({ scrollHeight: 1200 });
+    await triggerResize();
+    await flushFrame();
+
+    expect(geom.scrollTop).toBe(800);
+  });
+
   it('lands new conversation at its own bottom when switching conversations', async () => {
     const { rerender } = render(chatPaneEl(sampleMessages, 'conv-A'));
     setGeom({ scrollHeight: 1000, clientHeight: 400, scrollTop: 0 });
@@ -195,9 +264,9 @@ describe('chat scroll behavior', () => {
     rerender(chatPaneEl(sampleMessages, 'conv-B'));
     await flushFrame();
 
-    // Saved state was cleared by the activeConversationId-reset effect,
-    // so the new conversation lands at its own scrollHeight rather than
+    // Saved state was cleared by the activeConversationId-reset effect, so
+    // the new conversation lands at its own bottom (1000 - 400) rather than
     // the browser default 0.
-    expect(geom.scrollTop).toBe(1000);
+    expect(geom.scrollTop).toBe(600);
   });
 });

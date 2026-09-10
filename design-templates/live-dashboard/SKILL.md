@@ -20,7 +20,6 @@ od:
   mode: prototype
   platform: desktop
   scenario: operation
-  featured: 1
   fidelity: high
   preview:
     type: html
@@ -174,7 +173,7 @@ Wire these in a single `<script>` block at the bottom of `index.html`:
 
 ## Self-critique (must run before emitting)
 
-Score the artifact on the five dimensions inherited from `skills/critique/`:
+Score the artifact on the five dimensions inherited from `design-templates/critique/`:
 **Philosophy · Hierarchy · Detail · Function · Innovation**.
 
 If `Philosophy < 4` ("looks AI-generated"), iterate on type and palette
